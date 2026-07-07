@@ -1,0 +1,89 @@
+"""Central configuration: paths, sheet identifiers, tab names, secrets.
+
+Secrets are loaded from a .env file (see .env.example). Everything else is a
+constant that rarely changes but is kept here so there are no magic strings
+scattered across the codebase.
+"""
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# --- Paths -----------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+CREDENTIALS_FILE = BASE_DIR / "credentials.json"
+PAYME_QR_FILE = BASE_DIR / "payme_qr.png"
+
+# --- Secrets / env ---------------------------------------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+STRIPE_LINK = os.getenv("STRIPE_LINK", "").strip()
+
+# Admin's personal Telegram chat_id — payment-proof photos are forwarded here.
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+
+# --- Google Sheet ----------------------------------------------------------
+SHEET_ID = "1g20J-FakHFRhAQFpqU4ZaxVwhUuJQuC-wp6o-3qENdI"
+
+# Tabs that are NOT student groups and must always be skipped.
+SPECIAL_TABS = {"bot apps", "bot data", "send log"}  # compared case-insensitively
+
+BOT_DATA_TAB = "Bot Data"
+SEND_LOG_TAB = "Send Log"
+
+# --- Column headers (matched case-insensitively, whitespace-trimmed) --------
+# Group tabs
+COL_NUM = "№"
+COL_NAME = "Name"
+COL_TG = "TG Contact"
+COL_EMAIL = "Email"
+COL_AMOUNT = "Amount"
+COL_METHOD = "Method"
+COL_STATUS = "Status"
+COL_CONTACT = "Contact"
+COL_DATE_OF_PAYMENT = "Date of Payment"
+COL_TOTAL = "Total"
+
+# Bot Data tab
+BD_USERNAME = "Telegram Username"
+BD_CHAT_ID = "Telegram Chat ID"
+BD_FIRST_LINKED = "First Linked Date"
+BD_LAST_STATUS = "Last Known Status"
+# Payment proofs are recorded here (group tabs are read-only / confidential).
+# Proofs are forwarded to the admin via Telegram; BD_PROOF_LINK stores the
+# Telegram file_id of the submitted photo (lets the bot re-send it later).
+BD_PROOF_LINK = "Payment Proof Link"
+BD_PROOF_DATE = "Proof Submitted Date"
+
+# Send Log tab
+SL_DATE_SENT = "Date Sent"
+SL_GROUP_TAB = "Group Tab"
+SL_STUDENT_NAME = "Student Name"
+SL_TG_CONTACT = "TG Contact"
+SL_RESULT = "Result"
+SL_REMINDER_NUM = "Reminder Number"
+
+# Statuses that mean "no reminder needed".
+PAID_STATUSES = {"paid", "scholarship"}
+
+# --- Scheduler -------------------------------------------------------------
+REMINDER_INTERVAL_DAYS = 3          # reminder job cadence
+PAYMENT_CHECK_HOUR = 9              # daily payment-confirmation job runs at 09:00 local
+PAYMENT_CHECK_MINUTE = 0
+
+
+def validate() -> list[str]:
+    """Return a list of human-readable configuration problems (empty if OK)."""
+    problems = []
+    if not TELEGRAM_BOT_TOKEN:
+        problems.append("TELEGRAM_BOT_TOKEN is not set in .env")
+    if not STRIPE_LINK or "REPLACE_ME" in STRIPE_LINK:
+        problems.append("STRIPE_LINK is not set to a real link in .env")
+    if not CREDENTIALS_FILE.exists():
+        problems.append(f"credentials.json not found at {CREDENTIALS_FILE}")
+    if not PAYME_QR_FILE.exists():
+        problems.append(f"payme_qr.png not found at {PAYME_QR_FILE}")
+    if not ADMIN_CHAT_ID:
+        problems.append("ADMIN_CHAT_ID is not set in .env (proofs are forwarded there)")
+    return problems
