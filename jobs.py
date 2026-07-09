@@ -40,6 +40,10 @@ async def run_reminders(bot):
 
         key = sheets.normalize_username(rec["tg"])
         entry = bot_data.get(key)
+
+        if entry and str(entry.get("proof_link", "")).strip():
+            skipped += 1
+            continue
         if not entry or not str(entry.get("chat_id", "")).strip():
             await asyncio.to_thread(
                 sheets.append_send_log,
@@ -71,6 +75,7 @@ async def run_reminders(bot):
             sheets.append_send_log,
             rec["group"], rec["name"], rec["tg"], "sent", reminder_number,
         )
+        await asyncio.to_thread(sheets.mark_pay_shown, rec["tg"])
         sent_counts[key] = reminder_number  # keep count fresh within this run
         sent += 1
 

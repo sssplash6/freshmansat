@@ -21,16 +21,21 @@ def welcome_no_username() -> str:
     )
 
 
-def status_found(amount: str, status: str, total: str) -> str:
+def status_found(name: str, group: str, amount: str, status: str) -> str:
+    name = name or "—"
+    group = group or "—"
     amount = amount or "—"
     status = status or "—"
-    total = total or "—"
-    return (
-        "📋 Here's your record:\n\n"
-        f"• Amount: {amount}\n"
-        f"• Status: {status}\n"
-        f"• Total: {total}"
-    )
+    lines = [
+        "📋 Here's your record:\n",
+        f"• Name: {name}",
+        f"• Group: {group}",
+        f"• Amount: {amount}",
+        f"• Status: {status}",
+    ]
+    if status.strip().lower() not in ("paid", "scholarship"):
+        lines.append("\nUse /pay to see how to complete your payment.")
+    return "\n".join(lines)
 
 
 def status_not_found() -> str:
@@ -69,6 +74,28 @@ def admin_proof_caption(name: str, group: str, amount: str) -> str:
         f"• Amount: {amount or '—'}"
     )
 
+def pay_info(name: str, amount: str) -> str:
+    greeting_name = name or "there"
+    amount = amount or "your balance"
+    return (
+        f"Hi {greeting_name}, here's how to pay {amount}:\n\n"
+        f"{_payment_options(amount)}"
+    )
+def proof_rejected() -> str:
+    return (
+        "❌ We reviewed your payment proof and couldn't verify it.\n\n"
+        "This could be due to an unclear screenshot, wrong amount, or an "
+        "issue with the transaction. Please use /pay to see your payment "
+        "details again, complete the payment, and resend a clear screenshot."
+    )
+
+def proof_before_pay_info() -> str:
+    return (
+        "🤔 We haven't sent you your payment details yet, so this photo can't "
+        "be matched to a payment.\n\n"
+        "Please use /pay first to see your amount and payment options, then "
+        "send your payment proof after completing the payment."
+    )
 
 def _extract_amount_key(amount: str) -> str | None:
     """Pull a bare number like '89' out of strings like '$89', '89 usd', '89.00'."""
@@ -92,7 +119,9 @@ def _payment_options(amount: str) -> str:
     return (
         "You can pay either way:\n"
         f"{_stripe_line(amount)}\n"
-        "📱 Payme: scan the QR code below."
+        "📱 Payme: scan the QR code below.\n\n"
+        "📸 After paying, please send a screenshot of your payment as a photo "
+        "here, so we can verify it."
     )
 
 

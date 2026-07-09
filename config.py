@@ -27,7 +27,7 @@ STRIPE_LINKS = {
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
 # --- Google Sheet ----------------------------------------------------------
-SHEET_ID = "1g20J-FakHFRhAQFpqU4ZaxVwhUuJQuC-wp6o-3qENdI"
+SHEET_ID = "1hvhQrigI1xwOxQ-n38n34jC38DoAJk3upEQjCgShG_k"
 
 # Tabs that are NOT student groups and must always be skipped.
 SPECIAL_TABS = {"bot apps", "bot data", "send log"}  # compared case-insensitively
@@ -66,12 +66,14 @@ SL_STUDENT_NAME = "Student Name"
 SL_TG_CONTACT = "TG Contact"
 SL_RESULT = "Result"
 SL_REMINDER_NUM = "Reminder Number"
+BD_PAY_SHOWN = "Payment Info Shown"
 
 # Statuses that mean "no reminder needed".
 PAID_STATUSES = {"paid", "scholarship"}
 
 # --- Scheduler -------------------------------------------------------------
 REMINDER_INTERVAL_DAYS = 3          # reminder job cadence
+REMINDER_INTERVAL_MINUTES = int(os.getenv("REMINDER_INTERVAL_MINUTES", "0"))
 PAYMENT_CHECK_HOUR = 9              # daily payment-confirmation job runs at 09:00 local
 PAYMENT_CHECK_MINUTE = 0
 

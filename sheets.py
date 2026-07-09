@@ -178,6 +178,7 @@ _BD_COLS = (
     config.BD_LAST_STATUS,
     config.BD_PROOF_LINK,
     config.BD_PROOF_DATE,
+    config.BD_PAY_SHOWN
 )
 
 
@@ -203,9 +204,24 @@ def get_bot_data_map():
             "chat_id": row[config.BD_CHAT_ID],
             "first_linked": row[config.BD_FIRST_LINKED],
             "last_status": row[config.BD_LAST_STATUS],
+            "pay_shown": row[config.BD_PAY_SHOWN],
+            "proof_link": row[config.BD_PROOF_LINK],
         }
     return result
 
+def mark_pay_shown(username):
+    """Record that this user has been shown payment details (via /pay or a reminder)."""
+    ws = _bot_data_ws()
+    headers = _cached_headers(ws, _BD_COLS, "bot_data")
+    col = _header_index(headers, config.BD_PAY_SHOWN)
+    if col is None:
+        return
+    _, idx, rows = _read(ws, _BD_COLS)
+    target = normalize_username(username)
+    for row in rows:
+        if normalize_username(row[config.BD_USERNAME]) == target:
+            ws.update_cell(row["_row"], col + 1, today_str())
+            return
 
 def find_bot_data_row(username):
     """Return the Bot Data record for ``username`` (or None)."""
@@ -221,9 +237,25 @@ def find_bot_data_row(username):
                 "chat_id": row[config.BD_CHAT_ID],
                 "first_linked": row[config.BD_FIRST_LINKED],
                 "last_status": row[config.BD_LAST_STATUS],
+                "pay_shown": row[config.BD_PAY_SHOWN],
             }
     return None
 
+def clear_payment_proof(username):
+    """Clear proof link/date for a user, e.g. after rejecting a submission."""
+    ws = _bot_data_ws()
+    _, idx, rows = _read(ws, _BD_COLS)
+    target = normalize_username(username)
+    link_col = idx.get(config.BD_PROOF_LINK)
+    date_col = idx.get(config.BD_PROOF_DATE)
+    if link_col is None or date_col is None:
+        return False
+    for row in rows:
+        if normalize_username(row[config.BD_USERNAME]) == target:
+            ws.update_cell(row["_row"], link_col + 1, "")
+            ws.update_cell(row["_row"], date_col + 1, "")
+            return True
+    return False
 
 def register_user(username, chat_id):
     """Ensure the user exists in Bot Data.
@@ -254,6 +286,19 @@ def register_user(username, chat_id):
     ws.append_row(new_row, value_input_option="USER_ENTERED")
     return "created"
 
+def set_status_paid(ws, row_number):
+    """Set Status to 'Paid' and Date of Payment to today, for a specific row."""
+    values = ws.get_all_values()
+    header_i = _detect_header_row(values, (config.COL_STATUS, config.COL_DATE_OF_PAYMENT))
+    headers = values[header_i]
+
+    status_col = _header_index(headers, config.COL_STATUS)
+    date_col = _header_index(headers, config.COL_DATE_OF_PAYMENT)
+
+    if status_col is not None:
+        ws.update_cell(row_number, status_col + 1, "Paid")
+    if date_col is not None:
+        ws.update_cell(row_number, date_col + 1, today_str())
 
 def set_payment_proof(username, link, date_str):
     """Write a payment-proof link + submission date into the user's Bot Data row.
