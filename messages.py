@@ -70,10 +70,28 @@ def admin_proof_caption(name: str, group: str, amount: str) -> str:
     )
 
 
-def _payment_options() -> str:
+def _extract_amount_key(amount: str) -> str | None:
+    """Pull a bare number like '89' out of strings like '$89', '89 usd', '89.00'."""
+    import re
+    match = re.search(r"\d+", amount or "")
+    return match.group(0) if match else None
+
+
+def _stripe_line(amount: str) -> str:
+    key = _extract_amount_key(amount)
+    link = config.STRIPE_LINKS.get(key) if key else None
+    if link:
+        return f"💳 Card (Stripe): {link}"
+    return (
+        "💳 Card (Stripe): please contact the admin for your payment link, "
+        "since your amount doesn't match a preset option."
+    )
+
+
+def _payment_options(amount: str) -> str:
     return (
         "You can pay either way:\n"
-        f"💳 Card (Stripe): {config.STRIPE_LINK}\n"
+        f"{_stripe_line(amount)}\n"
         "📱 Payme: scan the QR code below."
     )
 
@@ -102,4 +120,4 @@ def reminder_text(name: str, amount: str, reminder_number: int) -> str:
             "Please complete payment using one of the options below:"
         )
 
-    return f"{body}\n\n{_payment_options()}"
+    return f"{body}\n\n{_payment_options(amount)}"

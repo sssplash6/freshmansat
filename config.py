@@ -18,7 +18,10 @@ PAYME_QR_FILE = BASE_DIR / "payme_qr.png"
 
 # --- Secrets / env ---------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-STRIPE_LINK = os.getenv("STRIPE_LINK", "").strip()
+STRIPE_LINKS = {
+    "89": os.getenv("STRIPE_LINK_89", "").strip(),
+    "119": os.getenv("STRIPE_LINK_119", "").strip(),
+}
 
 # Admin's personal Telegram chat_id — payment-proof photos are forwarded here.
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
@@ -78,8 +81,8 @@ def validate() -> list[str]:
     problems = []
     if not TELEGRAM_BOT_TOKEN:
         problems.append("TELEGRAM_BOT_TOKEN is not set in .env")
-    if not STRIPE_LINK or "REPLACE_ME" in STRIPE_LINK:
-        problems.append("STRIPE_LINK is not set to a real link in .env")
+    if not all(STRIPE_LINKS.values()):
+        problems.append("One or both STRIPE_LINK_89 / STRIPE_LINK_119 are not set in .env")
     if not CREDENTIALS_FILE.exists():
         problems.append(f"credentials.json not found at {CREDENTIALS_FILE}")
     if not PAYME_QR_FILE.exists():
