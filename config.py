@@ -71,6 +71,18 @@ BD_PAY_SHOWN = "Payment Info Shown"
 # Statuses that mean "no reminder needed".
 PAID_STATUSES = {"paid", "scholarship"}
 
+# --- Penalty Tracker Sheet (separate spreadsheet) ---------------------------
+# NOTE: double-check this ID against the real Penalty Tracker sheet's URL
+# before relying on it — it was picked up from a Google error message rather
+# than confirmed directly.
+PENALTY_SHEET_ID = "1j6ZanQEa4FOT6Cr9W2FlwItvPs6if_GRvoy1vQpmTfw"
+PENALTY_LOOKUP_TAB = "PenaltyLookupForBot"
+
+PL_TG_HANDLE = "TG Handle"
+PL_STUDENT_NAME = "Student Name"
+PL_CLASS = "Class"
+PL_TOTAL_POINTS = "Total Active Penalties"
+
 # --- Scheduler -------------------------------------------------------------
 REMINDER_INTERVAL_DAYS = 3          # reminder job cadence
 REMINDER_INTERVAL_MINUTES = int(os.getenv("REMINDER_INTERVAL_MINUTES", "0"))

@@ -150,3 +150,22 @@ def reminder_text(name: str, amount: str, reminder_number: int) -> str:
         )
 
     return f"{body}\n\n{_payment_options(amount)}"
+
+
+def penalty_found(name: str, class_name: str, points: str) -> str:
+    name = name or "—"
+    class_name = class_name or "—"
+    points = points or "0"
+    return (
+        "📊 Your penalty record:\n\n"
+        f"• Name: {name}\n"
+        f"• Class: {class_name}\n"
+        f"• Total Points: {points}"
+    )
+
+
+def penalty_not_found() -> str:
+    return (
+        "🔍 I couldn't find a penalty record linked to your username.\n\n"
+        "Please contact the admin so they can check your details."
+    )

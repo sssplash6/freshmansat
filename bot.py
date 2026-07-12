@@ -1,8 +1,8 @@
 """Telegram bot entrypoint.
 
-Registers the /start and /status command handlers, and wires up the two
-APScheduler jobs (reminders + payment confirmation) to run alongside the bot's
-async event loop.
+Registers the /start, /status, and /penalty command handlers, and wires up the
+two APScheduler jobs (reminders + payment confirmation) to run alongside the
+bot's async event loop.
 
 Run:  ./venv/bin/python bot.py
 """
@@ -65,6 +65,24 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(messages.status_not_found())
+
+
+async def penalty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Report the sender's total active penalty points from Penalty Tracker."""
+    user = update.message.from_user
+    username = user.username
+
+    if not username:
+        await update.message.reply_text(messages.welcome_no_username())
+        return
+
+    rec = await asyncio.to_thread(sheets.find_penalty_record, username)
+    if rec:
+        await update.message.reply_text(
+            messages.penalty_found(rec["name"], rec["class"], rec["points"])
+        )
+    else:
+        await update.message.reply_text(messages.penalty_not_found())
 
 
 async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,6 +288,7 @@ def main():
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("penalty", penalty))
     app.add_handler(CommandHandler("reject", reject))
     app.add_handler(MessageHandler(filters.PHOTO, photo))
     app.add_handler(CommandHandler("pay", pay))

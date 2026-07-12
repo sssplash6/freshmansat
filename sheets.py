@@ -20,6 +20,7 @@ import config
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 _spreadsheet = None
+_penalty_spreadsheet = None
 _ws_cache: dict = {}
 _header_cache: dict = {}
 
@@ -35,6 +36,23 @@ def get_spreadsheet():
         client = gspread.authorize(creds)
         _spreadsheet = client.open_by_key(config.SHEET_ID)
     return _spreadsheet
+
+
+def get_penalty_spreadsheet():
+    """Return the (cached) Penalty Tracker Spreadsheet handle.
+
+    Separate spreadsheet from the payment sheet — the same service account
+    (credentials.json) must be shared as at least Viewer on this sheet too,
+    or this will raise a permissions error on first use.
+    """
+    global _penalty_spreadsheet
+    if _penalty_spreadsheet is None:
+        creds = Credentials.from_service_account_file(
+            str(config.CREDENTIALS_FILE), scopes=SCOPES
+        )
+        client = gspread.authorize(creds)
+        _penalty_spreadsheet = client.open_by_key(config.PENALTY_SHEET_ID)
+    return _penalty_spreadsheet
 
 
 def _ws(title):
@@ -391,3 +409,49 @@ def append_send_log(group_tab, student_name, tg_contact, result, reminder_number
         },
     )
     ws.append_row(row, value_input_option="USER_ENTERED")
+
+
+# --- Penalty Tracker lookup (read-only) -------------------------------------
+_PL_COLS = (
+    config.PL_TG_HANDLE,
+    config.PL_STUDENT_NAME,
+    config.PL_CLASS,
+    config.PL_TOTAL_POINTS,
+)
+
+
+def find_penalty_record(username):
+    """Look up a student's total penalty points by TG handle, or None.
+
+    Reads the 'PenaltyLookupForBot' tab in the separate Penalty Tracker
+    spreadsheet, which is refreshed automatically whenever penalties change
+    on that sheet's side. This function is read-only.
+    """
+    target = normalize_username(username)
+    if not target:
+        return None
+
+    ws = get_penalty_spreadsheet().worksheet(config.PENALTY_LOOKUP_TAB)
+    values = ws.get_all_values()
+    if not values:
+        return None
+
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in _PL_COLS}
+    tg_i = idx.get(config.PL_TG_HANDLE)
+    if tg_i is None:
+        return None
+
+    for raw in values[1:]:
+        if tg_i >= len(raw):
+            continue
+        if normalize_username(raw[tg_i]) == target:
+            def get(col):
+                i = idx.get(col)
+                return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
+            return {
+                "name": get(config.PL_STUDENT_NAME),
+                "class": get(config.PL_CLASS),
+                "points": get(config.PL_TOTAL_POINTS),
+            }
+    return None
