@@ -21,6 +21,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 _spreadsheet = None
 _penalty_spreadsheet = None
+_admin_panel_spreadsheet = None
 _ws_cache: dict = {}
 _header_cache: dict = {}
 
@@ -55,6 +56,24 @@ def get_penalty_spreadsheet():
     return _penalty_spreadsheet
 
 
+def get_admin_panel_spreadsheet():
+    """Return the (cached) Admin Panel Spreadsheet handle.
+
+    This is the spreadsheet Code.gs is bound to. The bot only ever writes to
+    its Payment_Log tab (audit trail) — it never touches Finance sheet data
+    from this handle, and Apps Script never touches Finance directly either.
+    The service account needs at least Editor access to this spreadsheet.
+    """
+    global _admin_panel_spreadsheet
+    if _admin_panel_spreadsheet is None:
+        creds = Credentials.from_service_account_file(
+            str(config.CREDENTIALS_FILE), scopes=SCOPES
+        )
+        client = gspread.authorize(creds)
+        _admin_panel_spreadsheet = client.open_by_key(config.ADMIN_PANEL_SHEET_ID)
+    return _admin_panel_spreadsheet
+
+
 def _ws(title):
     """Return a cached Worksheet handle by title."""
     if title not in _ws_cache:
@@ -77,6 +96,10 @@ def normalize_username(username) -> str:
 
 def today_str() -> str:
     return datetime.date.today().isoformat()
+
+
+def now_str() -> str:
+    return datetime.datetime.now().isoformat(sep=" ", timespec="seconds")
 
 
 def _header_index(headers, name):
@@ -317,6 +340,49 @@ def set_status_paid(ws, row_number):
         ws.update_cell(row_number, status_col + 1, "Paid")
     if date_col is not None:
         ws.update_cell(row_number, date_col + 1, today_str())
+
+
+def set_status_unpaid(ws, row_number):
+    """Set Status to 'Unpaid' for a specific row.
+
+    Counterpart to set_status_paid, used only by the admin-override path
+    (/admin_setpayment ... unpaid) — there's no inline button for this since
+    the normal proof-approval flow only ever moves a student TO Paid.
+    Deliberately does not clear Date of Payment, so a historical record of
+    when they last paid is preserved even if their status is later reverted.
+    """
+    values = ws.get_all_values()
+    header_i = _detect_header_row(values, (config.COL_STATUS,))
+    headers = values[header_i]
+
+    status_col = _header_index(headers, config.COL_STATUS)
+    if status_col is not None:
+        ws.update_cell(row_number, status_col + 1, "Unpaid")
+
+
+# --- Payment_Log tab (Admin Panel spreadsheet) ------------------------------
+_PAYMENT_LOG_TAB = "Payment_Log"
+_PAYMENT_LOG_HEADERS = ["Timestamp", "Student", "Username", "Status", "Amount", "Source"]
+
+
+def log_payment_change(student_name, username, new_status, source, amount=""):
+    """Append an audit row to Payment_Log in the Admin Panel spreadsheet.
+
+    This is the ONLY thing the Admin Panel (Apps Script side) ever reads for
+    payment history — it never touches the Finance sheet directly. Called
+    from bot.py's approve_payment() and set_unpaid(), always alongside the
+    Finance sheet write, so the two can never drift apart.
+
+    source: 'proof' (student-submitted photo, admin tapped Approve) or
+            'admin_override' (/admin_setpayment command)
+    """
+    admin_panel = get_admin_panel_spreadsheet()
+    ws = admin_panel.worksheet(_PAYMENT_LOG_TAB)
+    ws.append_row(
+        [now_str(), student_name, normalize_username(username), new_status, amount, source],
+        value_input_option="USER_ENTERED",
+    )
+
 
 def set_payment_proof(username, link, date_str):
     """Write a payment-proof link + submission date into the user's Bot Data row.

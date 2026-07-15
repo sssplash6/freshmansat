@@ -6,6 +6,11 @@ Two jobs, both driven by APScheduler (see bot.py):
 
 Both read the bulk tables once (Bot Data / Send Log) to stay well under the
 Sheets API rate limits, and offload blocking gspread calls to worker threads.
+
+All outbound messages to students go through notify_student(), which honors
+config.SUPPRESS_STUDENT_MESSAGES — while that's True, both jobs run their
+full logic (reading sheets, deciding who to message, logging to Send Log)
+but no actual Telegram message is sent. Safe to test against real data.
 """
 import asyncio
 import logging
@@ -13,6 +18,7 @@ import logging
 import config
 import messages
 import sheets
+from notify import notify_student
 
 log = logging.getLogger(__name__)
 
@@ -57,10 +63,8 @@ async def run_reminders(bot):
 
         try:
             with open(config.PAYME_QR_FILE, "rb") as photo:
-                await bot.send_photo(
-                    chat_id=int(entry["chat_id"]),
-                    photo=photo,
-                    caption=caption,
+                await notify_student(
+                    bot, int(entry["chat_id"]), photo=photo, caption=caption
                 )
         except Exception as exc:  # network / blocked / bad chat_id
             log.warning("Reminder to %s failed: %s", rec["tg"], exc)
@@ -71,17 +75,18 @@ async def run_reminders(bot):
             errors += 1
             continue
 
+        log_result = "sent" if not config.SUPPRESS_STUDENT_MESSAGES else "suppressed (test mode)"
         await asyncio.to_thread(
             sheets.append_send_log,
-            rec["group"], rec["name"], rec["tg"], "sent", reminder_number,
+            rec["group"], rec["name"], rec["tg"], log_result, reminder_number,
         )
         await asyncio.to_thread(sheets.mark_pay_shown, rec["tg"])
         sent_counts[key] = reminder_number  # keep count fresh within this run
         sent += 1
 
     log.info(
-        "Reminder job: done (sent=%d, no_chat=%d, errors=%d, skipped=%d)",
-        sent, no_chat, errors, skipped,
+        "Reminder job: done (sent=%d, no_chat=%d, errors=%d, skipped=%d, suppressed=%s)",
+        sent, no_chat, errors, skipped, config.SUPPRESS_STUDENT_MESSAGES,
     )
 
 
@@ -111,9 +116,8 @@ async def run_payment_check(bot):
         newly_paid = _is_paid(current) and not _is_paid(last)
         if newly_paid and str(entry.get("chat_id", "")).strip():
             try:
-                await bot.send_message(
-                    chat_id=int(entry["chat_id"]),
-                    text=messages.payment_success(rec["name"]),
+                await notify_student(
+                    bot, int(entry["chat_id"]), text=messages.payment_success(rec["name"])
                 )
                 notified += 1
             except Exception as exc:
@@ -126,6 +130,6 @@ async def run_payment_check(bot):
             updated += 1
 
     log.info(
-        "Payment-check job: done (notified=%d, statuses_updated=%d)",
-        notified, updated,
+        "Payment-check job: done (notified=%d, statuses_updated=%d, suppressed=%s)",
+        notified, updated, config.SUPPRESS_STUDENT_MESSAGES,
     )

@@ -21,11 +21,13 @@ from telegram.ext import (
     filters,
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 from telegram.ext import CallbackQueryHandler
 import config
 import jobs
 import messages
 import sheets
+from notify import notify_student
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -146,6 +148,200 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(messages.proof_received())
     log.info("Proof from @%s recorded (file_id=%s)", username, file_id)
 
+async def approve_payment(bot, target_username: str, source: str) -> tuple[bool, str]:
+    """Single entry point for marking a student Paid.
+
+    Used by both the admin's inline Approve button (source='proof') and the
+    /admin_setpayment command (source='admin_override'). This is the ONLY
+    place that writes Paid status to the Finance sheet — Apps Script never
+    touches Finance directly. Every write here also logs to Payment_Log in
+    the Admin Panel spreadsheet so the admin panel has full visibility
+    without needing Finance access itself.
+
+    Returns (success, message) for the caller to relay back to the admin.
+    """
+    rec = await asyncio.to_thread(sheets.find_student, target_username)
+    if not rec:
+        return False, f"No student record found for @{target_username}."
+
+    bd_entry = await asyncio.to_thread(sheets.find_bot_data_row, target_username)
+
+    await asyncio.to_thread(sheets.set_status_paid, rec["worksheet"], rec["row_number"])
+    await asyncio.to_thread(
+        sheets.log_payment_change, rec["name"], target_username, "Paid", source, rec["amount"]
+    )
+
+    if bd_entry and bd_entry.get("chat_id"):
+        await asyncio.to_thread(sheets.update_last_known_status, bd_entry["row_number"], "Paid")
+        try:
+            await notify_student(
+                bot, int(bd_entry["chat_id"]), text=messages.payment_success(rec["name"])
+            )
+        except Exception as exc:
+            log.warning("Could not notify @%s of payment approval: %s", target_username, exc)
+
+    return True, f"Marked @{target_username} ({rec['name']}) as Paid."
+
+
+async def set_unpaid(target_username: str, source: str) -> tuple[bool, str]:
+    """Reverts a student to Unpaid. Admin-override only — there's no inline
+    button for this since the normal flow only ever moves Unpaid -> Paid."""
+    rec = await asyncio.to_thread(sheets.find_student, target_username)
+    if not rec:
+        return False, f"No student record found for @{target_username}."
+
+    await asyncio.to_thread(sheets.set_status_unpaid, rec["worksheet"], rec["row_number"])
+    await asyncio.to_thread(
+        sheets.log_payment_change, rec["name"], target_username, "Unpaid", source, rec["amount"]
+    )
+
+    bd_entry = await asyncio.to_thread(sheets.find_bot_data_row, target_username)
+    if bd_entry:
+        await asyncio.to_thread(sheets.update_last_known_status, bd_entry["row_number"], "Unpaid")
+
+    return True, f"Marked @{target_username} ({rec['name']}) as Unpaid."
+
+
+async def set_bot_commands(app: Application):
+    """Registers Telegram's native '/' autocomplete menu.
+
+    Students see one set of commands with plain-language descriptions (no
+    need to remember exact syntax — Telegram shows the description as they
+    type). The admin chat sees an additional set on top, scoped so no other
+    chat can see or use them.
+    """
+    student_commands = [
+        BotCommand("start", "Register with the bot"),
+        BotCommand("status", "Check your payment status"),
+        BotCommand("pay", "Get payment details and QR code"),
+        BotCommand("penalty", "Check your penalty points"),
+    ]
+    await app.bot.set_my_commands(student_commands, scope=BotCommandScopeDefault())
+
+    if config.ADMIN_CHAT_ID:
+        admin_commands = student_commands + [
+            BotCommand("admin", "Open the admin menu"),
+            BotCommand("admin_setpayment", "Set a student's payment status directly"),
+            BotCommand("reject", "Reject a student's payment proof"),
+        ]
+        await app.bot.set_my_commands(
+            admin_commands,
+            scope=BotCommandScopeChat(chat_id=int(config.ADMIN_CHAT_ID)),
+        )
+
+
+# --- Guided admin menu (buttons instead of typed syntax) -------------------
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admin — entry point to a button-driven menu, so the admin never has
+    to remember exact command syntax."""
+    if str(update.message.chat_id) != str(config.ADMIN_CHAT_ID):
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 Set payment status", callback_data="admin_menu:setpayment")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="admin_menu:cancel")],
+    ])
+    await update.message.reply_text(
+        "Admin menu — what would you like to do?", reply_markup=keyboard
+    )
+
+
+async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles taps on the /admin menu buttons and the Paid/Unpaid sub-menu."""
+    query = update.callback_query
+    await query.answer()
+
+    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+        return
+
+    _, _, action = query.data.partition(":")
+
+    if action == "cancel":
+        context.user_data.pop("pending_admin_action", None)
+        await query.edit_message_text("Cancelled.")
+        return
+
+    if action == "setpayment":
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Paid", callback_data="admin_setpayment_status:paid"),
+                InlineKeyboardButton("❌ Unpaid", callback_data="admin_setpayment_status:unpaid"),
+            ],
+            [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
+        ])
+        await query.edit_message_text("Set status to:", reply_markup=keyboard)
+        return
+
+    if action.startswith("admin_setpayment_status"):
+        return  # handled by the dedicated callback below
+
+
+async def admin_setpayment_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Second step of the guided flow: after Paid/Unpaid is tapped, ask the
+    admin to just send the student's @username as a plain message."""
+    query = update.callback_query
+    await query.answer()
+
+    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+        return
+
+    _, _, status = query.data.partition(":")
+    context.user_data["pending_admin_action"] = {"type": "setpayment", "status": status}
+    await query.edit_message_text(
+        f"Setting status to *{status.title()}*.\n\n"
+        f"Now send the student's @username (just the username, as a normal message).",
+        parse_mode="Markdown",
+    )
+
+
+async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches the admin's plain-text reply after a guided-menu step that's
+    waiting on a username. Does nothing if there's no pending action, so it
+    never interferes with normal admin chatting."""
+    if str(update.message.chat_id) != str(config.ADMIN_CHAT_ID):
+        return
+
+    pending = context.user_data.get("pending_admin_action")
+    if not pending:
+        return  # no guided flow in progress — ignore, let other handlers run
+
+    target_username = update.message.text.strip().lstrip("@")
+
+    if pending["type"] == "setpayment":
+        if pending["status"] == "paid":
+            success, msg = await approve_payment(context.bot, target_username, source="admin_override")
+        else:
+            success, msg = await set_unpaid(target_username, source="admin_override")
+        await update.message.reply_text(msg if success else f"⚠️ {msg}")
+
+    context.user_data.pop("pending_admin_action", None)
+
+
+async def admin_setpayment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admin_setpayment <username> <paid|unpaid> — manual override, admin-only.
+
+    Routes through the exact same approve_payment()/set_unpaid() functions
+    the inline Approve button uses, so there is only ever one code path that
+    writes to the Finance sheet.
+    """
+    if str(update.message.chat_id) != str(config.ADMIN_CHAT_ID):
+        return  # silently ignore non-admins
+
+    if len(context.args) != 2 or context.args[1].lower() not in ("paid", "unpaid"):
+        await update.message.reply_text("Usage: /admin_setpayment <username> <paid|unpaid>")
+        return
+
+    target_username = context.args[0].lstrip("@")
+    new_status = context.args[1].lower()
+
+    if new_status == "paid":
+        success, msg = await approve_payment(context.bot, target_username, source="admin_override")
+    else:
+        success, msg = await set_unpaid(target_username, source="admin_override")
+
+    await update.message.reply_text(msg if success else f"⚠️ {msg}")
+
+
 async def proof_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -162,24 +358,13 @@ async def proof_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "reject":
         await asyncio.to_thread(sheets.clear_payment_proof, target_username)
-        await context.bot.send_message(
-            chat_id=int(bd_entry["chat_id"]),
-            text=messages.proof_rejected(),
-        )
+        await notify_student(context.bot, int(bd_entry["chat_id"]), text=messages.proof_rejected())
         await query.edit_message_caption(caption=query.message.caption + "\n\n❌ Rejected")
 
     elif action == "approve":
-        rec = await asyncio.to_thread(sheets.find_student, target_username)
-        if rec:
-            await asyncio.to_thread(sheets.set_status_paid, rec["worksheet"], rec["row_number"])
-        await query.edit_message_caption(caption=query.message.caption + "\n\n✅ Approved")
-        # The daily payment-check job will pick this up and send the thank-you,
-        # or trigger it immediately:
-        await asyncio.to_thread(sheets.update_last_known_status, bd_entry["row_number"], "Paid")
-        await context.bot.send_message(
-            chat_id=int(bd_entry["chat_id"]),
-            text=messages.payment_success(rec["name"] if rec else ""),
-        )
+        success, _ = await approve_payment(context.bot, target_username, source="proof")
+        suffix = "\n\n✅ Approved" if success else "\n\n⚠️ Approval failed — check logs."
+        await query.edit_message_caption(caption=query.message.caption + suffix)
 
 async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
@@ -257,10 +442,7 @@ async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await asyncio.to_thread(sheets.clear_payment_proof, target_username)
 
-    await context.bot.send_message(
-        chat_id=int(bd_entry["chat_id"]),
-        text=messages.proof_rejected(),
-    )
+    await notify_student(context.bot, int(bd_entry["chat_id"]), text=messages.proof_rejected())
     await update.message.reply_text(f"Rejected proof for @{target_username}, they've been notified.")
 
 async def on_shutdown(app: Application):
@@ -290,6 +472,7 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("penalty", penalty))
     app.add_handler(CommandHandler("reject", reject))
+    app.add_handler(CommandHandler("admin_setpayment", admin_setpayment))
     app.add_handler(MessageHandler(filters.PHOTO, photo))
     app.add_handler(CommandHandler("pay", pay))
     app.add_handler(CallbackQueryHandler(proof_decision))
