@@ -26,11 +26,11 @@ STRIPE_LINKS = {
 # Admin's personal Telegram chat_id — payment-proof photos are forwarded here.
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
-#ADMIN_PANEL_SHEET_ID = "1BdPzPXXF15LswLlyQOotlWyqZyPRaQcUodKndoTqXxE"
+ADMIN_PANEL_SHEET_ID = "1BdPzPXXF15LswLlyQOotlWyqZyPRaQcUodKndoTqXxE"
 # --- Google Sheet ----------------------------------------------------------
 SHEET_ID = "1hvhQrigI1xwOxQ-n38n34jC38DoAJk3upEQjCgShG_k"
 SUPPRESS_STUDENT_MESSAGES = True   # flip to False only when ready to go live
-ADMIN_PANEL_SHEET_ID = "..."       # Admin Panel spreadsheet ID
+
 
 # Tabs that are NOT student groups and must always be skipped.
 SPECIAL_TABS = {"bot apps", "bot data", "send log"}  # compared case-insensitively

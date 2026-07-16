@@ -13,6 +13,7 @@ full logic (reading sheets, deciding who to message, logging to Send Log)
 but no actual Telegram message is sent. Safe to test against real data.
 """
 import asyncio
+import datetime
 import logging
 
 import config
@@ -21,6 +22,91 @@ import sheets
 from notify import notify_student
 
 log = logging.getLogger(__name__)
+
+# How long after a session's official start time a student should be
+# alerted if they're marked Late/Absent for it.
+ALERT_DELAY_MINUTES = 10
+# This job should run at roughly this interval — the alert window below is
+# sized to match, so each session gets caught exactly once regardless of
+# exact trigger timing jitter.
+JOB_INTERVAL_MINUTES = 5
+
+_DAY_ABBREVIATIONS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+async def run_attendance_alerts(bot):
+    """Every JOB_INTERVAL_MINUTES, checks each group's schedule for a session
+    that started ALERT_DELAY_MINUTES ago, and — if so — alerts any student
+    marked Late/Absent for it with their reason and current penalty total.
+
+    Reads live from the Admin Panel spreadsheet (Groups, Roster,
+    Attendance_Log, Penalty_Log) via Code.gs's data, and is dedup-guarded by
+    AttendanceAlertLog so a student is never alerted twice for the same
+    session even if the job runs multiple times inside the alert window.
+    """
+    log.info("Attendance alert job: starting")
+    now = datetime.datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    today_abbrev = _DAY_ABBREVIATIONS[now.weekday()]
+
+    groups = await asyncio.to_thread(sheets.get_groups_schedule)
+    alerted = 0
+
+    for group in groups:
+        if today_abbrev not in group["days"]:
+            continue
+        if not group["start_time"]:
+            continue
+
+        try:
+            hour, minute = (int(x) for x in group["start_time"].split(":"))
+        except ValueError:
+            log.warning("Bad start_time for group %s: %r", group["name"], group["start_time"])
+            continue
+
+        session_start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        alert_window_start = session_start + datetime.timedelta(minutes=ALERT_DELAY_MINUTES)
+        alert_window_end = alert_window_start + datetime.timedelta(minutes=JOB_INTERVAL_MINUTES)
+
+        if not (alert_window_start <= now < alert_window_end):
+            continue  # not this group's alert window right now
+
+        rows = await asyncio.to_thread(sheets.get_todays_attendance_for_group, group["name"], today_str)
+        if not rows:
+            continue
+
+        roster = await asyncio.to_thread(sheets.get_roster_map)
+        already_alerted = await asyncio.to_thread(sheets.get_alerted_keys)
+
+        for row in rows:
+            student_name = row["student"]
+            key = f"{student_name}|{group['name']}|{today_str}"
+            if key in already_alerted:
+                continue
+
+            student = roster.get(student_name)
+            if not student or not student["tg"]:
+                log.warning("No roster/TG match for %s in %s — can't alert.", student_name, group["name"])
+                continue
+
+            bd_entry = await asyncio.to_thread(sheets.find_bot_data_row, student["tg"])
+            if not bd_entry or not bd_entry.get("chat_id"):
+                log.info("No linked chat for %s (@%s) — can't alert yet.", student_name, student["tg"])
+                continue
+
+            total_points = await asyncio.to_thread(sheets.get_penalty_total, student_name)
+
+            await notify_student(
+                bot, int(bd_entry["chat_id"]),
+                text=messages.attendance_alert(student_name, row["status"], total_points),
+            )
+            await asyncio.to_thread(sheets.log_alert, key)
+            alerted += 1
+
+    log.info("Attendance alert job: done (alerted=%d)", alerted)
+
+
+
 
 
 def _is_paid(status: str) -> bool:

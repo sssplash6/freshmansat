@@ -477,7 +477,327 @@ def append_send_log(group_tab, student_name, tg_contact, result, reminder_number
     ws.append_row(row, value_input_option="USER_ENTERED")
 
 
-# --- Penalty Tracker lookup (read-only) -------------------------------------
+# --- Admin Panel: Groups / Roster / Attendance_Log / Penalty_Log (read) ----
+# These read the SEPARATE Admin Panel spreadsheet (Code.gs's spreadsheet),
+# not the payment SHEET_ID above. Used by the attendance alert job.
+
+_ADMIN_GROUPS_COLS = ("Group Name", "Days", "Start Time", "End Time")
+_ADMIN_ROSTER_COLS = ("Student Name", "TG Handle", "Group")
+_ADMIN_ATTENDANCE_LOG_COLS = ("Student", "Group", "Session Date", "Status")
+_ADMIN_PENALTY_LOG_COLS = ("Student", "Points", "Status")
+
+_ATTENDANCE_ALERT_LOG_TAB = "AttendanceAlertLog"
+
+
+def get_groups_schedule():
+    """Reads the Admin Panel's Groups tab. Returns a list of dicts:
+    {name, days: ['Mon','Wed',...], start_time: 'HH:MM'}.
+    """
+    ws = get_admin_panel_spreadsheet().worksheet("Groups")
+    values = ws.get_all_values()
+    if not values:
+        return []
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in _ADMIN_GROUPS_COLS}
+    result = []
+    for raw in values[1:]:
+        def get(col):
+            i = idx.get(col)
+            return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
+        name = get("Group Name")
+        if not name:
+            continue
+        result.append({
+            "name": name,
+            "days": [d.strip() for d in get("Days").split(",") if d.strip()],
+            "start_time": get("Start Time"),
+        })
+    return result
+
+
+def get_roster_map():
+    """Reads the Admin Panel's Roster tab into {student_name: {tg, group}}."""
+    ws = get_admin_panel_spreadsheet().worksheet("Roster")
+    values = ws.get_all_values()
+    if not values:
+        return {}
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in _ADMIN_ROSTER_COLS}
+    result = {}
+    for raw in values[1:]:
+        def get(col):
+            i = idx.get(col)
+            return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
+        name = get("Student Name")
+        if not name:
+            continue
+        result[name] = {"tg": get("TG Handle"), "group": get("Group")}
+    return result
+
+
+def get_todays_attendance_for_group(group_name, date_str):
+    """Reads Attendance_Log rows for `group_name` whose Session Date matches
+    `date_str` (YYYY-MM-DD), returning only Late/Absent rows.
+    """
+    ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
+    values = ws.get_all_values()
+    if not values:
+        return []
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in _ADMIN_ATTENDANCE_LOG_COLS}
+    result = []
+    for raw in values[1:]:
+        def get(col):
+            i = idx.get(col)
+            return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
+        if get("Group") != group_name:
+            continue
+        if get("Status") not in ("Late", "Absent"):
+            continue
+        session_date_raw = get("Session Date")
+        # Session Date may be a full date string (e.g. from a Date-typed
+        # header cell) — match on just the YYYY-MM-DD portion.
+        if not session_date_raw.startswith(date_str) and date_str not in session_date_raw:
+            # Fall back to parsing common formats if the direct match fails.
+            try:
+                parsed = datetime.datetime.fromisoformat(session_date_raw[:19])
+                if parsed.strftime("%Y-%m-%d") != date_str:
+                    continue
+            except ValueError:
+                continue
+        result.append({"student": get("Student"), "status": get("Status")})
+    return result
+
+
+def get_penalty_total(student_name):
+    """Sums Active points for a student from the Admin Panel's Penalty_Log."""
+    ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
+    values = ws.get_all_values()
+    if not values:
+        return 0
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in _ADMIN_PENALTY_LOG_COLS}
+    total = 0
+    for raw in values[1:]:
+        def get(col):
+            i = idx.get(col)
+            return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
+        if get("Student") != student_name or get("Status") != "Active":
+            continue
+        try:
+            total += int(float(get("Points") or 0))
+        except ValueError:
+            pass
+    return total
+
+
+def _attendance_alert_log_ws():
+    ss = get_admin_panel_spreadsheet()
+    try:
+        return ss.worksheet(_ATTENDANCE_ALERT_LOG_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = ss.add_worksheet(title=_ATTENDANCE_ALERT_LOG_TAB, rows=100, cols=1)
+        ws.append_row(["Alert Key"])
+        return ws
+
+
+def get_alerted_keys():
+    """Dedup guard so the same student/session never gets alerted twice."""
+    ws = _attendance_alert_log_ws()
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return set()
+    return {row[0] for row in values[1:] if row}
+
+
+def log_alert(key):
+    _attendance_alert_log_ws().append_row([key])
+
+
+
+def search_roster(query):
+    """Case-insensitive substring match against student name or TG handle.
+    Returns a list of {name, tg, group} dicts — reads raw rows so a
+    multi-group student appears once per group they're actually in."""
+    query = query.strip().lower().lstrip("@")
+    if not query:
+        return []
+    results = [
+        row for row in get_roster_rows()
+        if query in row["name"].lower() or query in row["tg"].lower().lstrip("@")
+    ]
+    return results[:10]
+
+
+def get_roster_rows():
+    """Every row in Roster as-is, with NO deduplication by name — needed so
+    a student enrolled in more than one group (same name, same TG handle,
+    two separate rows with different Group values) shows up correctly in
+    each group's browse list. Returns [{name, tg, group}]."""
+    ws = get_admin_panel_spreadsheet().worksheet("Roster")
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return []
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in ("Student Name", "TG Handle", "Group")}
+    rows = []
+    for raw in values[1:]:
+        def get(col):
+            i = idx.get(col)
+            return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
+        name = get("Student Name")
+        if not name:
+            continue
+        rows.append({"name": name, "tg": get("TG Handle"), "group": get("Group")})
+    return rows
+
+
+def get_roster_map():
+    """Reads Roster into {student_name: {tg, group}}.
+
+    NOTE: if a student has multiple Roster rows (enrolled in more than one
+    group), this dict can only hold one entry per name — 'group' here ends
+    up being whichever row was read last, and is mainly useful for TG handle
+    lookup, not group membership. Use get_roster_by_group() or
+    get_roster_rows() for anything that needs to respect multi-group
+    students correctly.
+    """
+    result = {}
+    for row in get_roster_rows():
+        result[row["name"]] = {"tg": row["tg"], "group": row["group"]}
+    return result
+
+
+def get_roster_by_group(group_name):
+    """All roster entries for a specific group, as {name, tg, group} dicts.
+    Reads raw rows (not the deduped map) so multi-group students correctly
+    appear in every group they're actually enrolled in."""
+    return [row for row in get_roster_rows() if row["group"] == group_name]
+
+
+def get_active_penalties(student_name):
+    """Active Penalty_Log rows for a student, with sheet row numbers so they
+    can be individually removed. Returns [{row_number, reason, points, group}]."""
+    ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return []
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Reason", "Points", "Status")}
+    result = []
+    for r, raw in enumerate(values[1:], start=2):
+        def get(col):
+            i = idx.get(col)
+            return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
+        if get("Student") != student_name or get("Status") != "Active":
+            continue
+        result.append({
+            "row_number": r,
+            "group": get("Group"),
+            "reason": get("Reason"),
+            "points": get("Points"),
+        })
+    return result
+
+
+def add_manual_penalty(student_name, group, reason, points, assigned_by):
+    """Appends a manually-assigned penalty to Penalty_Log (Admin Panel)."""
+    ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
+    ws.append_row(
+        [now_str(), student_name, group, reason, points, "Manual", assigned_by, "Active"],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def remove_admin_panel_penalty(row_number):
+    """Soft-deletes a Penalty_Log row by setting Status to 'Removed'."""
+    ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
+    values = ws.get_all_values()
+    headers = values[0]
+    status_col = _header_index(headers, "Status")
+    if status_col is not None:
+        ws.update_cell(row_number, status_col + 1, "Removed")
+
+
+def get_latest_payment_status(username):
+    """Most recent Payment_Log entry for a username, or None."""
+    ws = get_admin_panel_spreadsheet().worksheet("Payment_Log")
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return None
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in ("Username", "Status", "Amount", "Timestamp")}
+    target = normalize_username(username)
+    latest = None
+    for raw in values[1:]:
+        def get(col):
+            i = idx.get(col)
+            return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
+        if normalize_username(get("Username")) == target:
+            latest = {"status": get("Status"), "amount": get("Amount"), "timestamp": get("Timestamp")}
+    return latest
+
+
+def get_student_profile(student_name):
+    """Aggregates everything the admin panel needs for a full student card:
+    roster info, attendance breakdown, homework breakdown, penalty total,
+    and latest payment status. Reads Admin Panel tabs only.
+
+    Attendance/homework/penalty totals are matched by student name alone
+    (no group filter), so a student enrolled in multiple groups correctly
+    gets one combined profile across all their groups — as long as their
+    name is spelled identically everywhere (Roster + each group's
+    attendance tab + Homework_Log/Penalty_Log).
+    """
+    matching_rows = [r for r in get_roster_rows() if r["name"] == student_name]
+    if not matching_rows:
+        return None
+
+    tg = next((r["tg"] for r in matching_rows if r["tg"]), "")
+    groups = [r["group"] for r in matching_rows if r["group"]]
+
+    ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
+    values = ws.get_all_values()
+    attendance_counts = {"Present": 0, "Late": 0, "Absent": 0}
+    if len(values) >= 2:
+        headers = values[0]
+        idx = {c: _header_index(headers, c) for c in ("Student", "Status")}
+        i_s, i_st = idx.get("Student"), idx.get("Status")
+        if i_s is not None and i_st is not None:
+            for raw in values[1:]:
+                if i_s < len(raw) and _norm(raw[i_s]) == student_name:
+                    status = _norm(raw[i_st]) if i_st < len(raw) else ""
+                    if status in attendance_counts:
+                        attendance_counts[status] += 1
+
+    ws = get_admin_panel_spreadsheet().worksheet("Homework_Log")
+    values = ws.get_all_values()
+    homework_counts = {"On Time": 0, "Late": 0, "Missing": 0}
+    if len(values) >= 2:
+        headers = values[0]
+        idx = {c: _header_index(headers, c) for c in ("Student", "Status")}
+        i_s, i_st = idx.get("Student"), idx.get("Status")
+        if i_s is not None and i_st is not None:
+            for raw in values[1:]:
+                if i_s < len(raw) and _norm(raw[i_s]) == student_name:
+                    status = _norm(raw[i_st]) if i_st < len(raw) else ""
+                    if status in homework_counts:
+                        homework_counts[status] += 1
+
+    total_points = get_penalty_total(student_name)
+    payment = get_latest_payment_status(tg) if tg else None
+
+    return {
+        "name": student_name,
+        "tg": tg,
+        "group": ", ".join(groups) if groups else "",
+        "attendance": attendance_counts,
+        "homework": homework_counts,
+        "total_points": total_points,
+        "payment": payment,
+    }
+
+
 _PL_COLS = (
     config.PL_TG_HANDLE,
     config.PL_STUDENT_NAME,

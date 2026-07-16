@@ -163,6 +163,9 @@ def penalty_found(name: str, class_name: str, points: str) -> str:
         f"• Total Points: {points}"
     )
 
+def attendance_alert(name, status, total_points):
+       return (f"⚠️ Hi {name}, you were marked *{status}* for today's session.\n"
+               f"Your current total penalty points: {total_points}.")
 
 def penalty_not_found() -> str:
     return (
