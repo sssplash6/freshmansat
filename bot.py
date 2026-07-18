@@ -9,6 +9,7 @@ Run:  ./venv/bin/python bot.py
 import asyncio
 import logging
 
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -28,6 +29,7 @@ import jobs
 import messages
 import sheets
 from notify import notify_student
+from telegram.helpers import escape_markdown
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -38,6 +40,18 @@ log = logging.getLogger("bot")
 
 
 # --- Command handlers ------------------------------------------------------
+
+def _md(text: str) -> str:
+    """Escape a piece of dynamic text (student name, TG handle, group name,
+    etc.) so it's safe to interpolate into a parse_mode='Markdown' message.
+    Telegram's legacy Markdown treats _, *, `, [ as formatting characters —
+    an unescaped underscore in something like a TG handle (@muhiddinov_javlon)
+    breaks parsing with 'can't find end of the entity'. Use this on every
+    piece of user/sheet-derived text going into a Markdown-formatted message.
+    """
+    return escape_markdown(text or "", version=1)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     username = user.username
@@ -312,20 +326,22 @@ async def admin_pick_student_callback(update: Update, context: ContextTypes.DEFA
         [InlineKeyboardButton("💰 Set payment status", callback_data="admin_action:setpayment_direct")],
         [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
     ])
-    await query.edit_message_text(f"*{student_name}* — what would you like to do?",
+    await query.edit_message_text(f"*{_md(student_name)}* — what would you like to do?",
                                    parse_mode="Markdown", reply_markup=keyboard)
-
 
 def _format_student_profile(profile: dict) -> str:
     payment = profile["payment"]
+    name = _md(profile['name'])
+    tg = _md(profile['tg'])
+    group = _md(profile['group'])
     payment_line = (
         f"{payment['status']} (amount: {payment['amount']}, as of {payment['timestamp']})"
         if payment else "No payment record yet"
     )
     return (
-        f"👤 *{profile['name']}*\n"
-        f"Group: {profile['group']}\n"
-        f"TG: {profile['tg']}\n\n"
+        f"👤 *{name}*\n"
+        f"Group: {group}\n"
+        f"TG: @{tg}\n\n"
         f"📅 Attendance — Present: {profile['attendance']['Present']}, "
         f"Late: {profile['attendance']['Late']}, Absent: {profile['attendance']['Absent']}\n"
         f"📚 Homework — On time: {profile['homework']['On Time']}, "
@@ -382,7 +398,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("✏️ Custom (type points + reason)", callback_data="admin_penalty_preset:custom")],
             [InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")],
         ])
-        await query.edit_message_text(f"Add penalty for *{student_name}* — pick a reason:",
+        await query.edit_message_text(f"Add penalty for *{_md(student_name)}* — pick a reason:",
                                        parse_mode="Markdown", reply_markup=keyboard)
         return
 
@@ -398,7 +414,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             for p in penalties
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")])
-        await query.edit_message_text(f"Remove which penalty for *{student_name}*?",
+        await query.edit_message_text(f"Remove which penalty for *{_md(student_name)}*?",
                                        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
@@ -487,7 +503,7 @@ async def admin_penalty_preset_callback(update: Update, context: ContextTypes.DE
     if preset_key == "custom":
         context.user_data["pending_admin_action"] = {"type": "addpenalty_custom", "student": student_name}
         await query.edit_message_text(
-            f"Adding a custom penalty for *{student_name}*.\n\n"
+            f"Adding a custom penalty for *{_md(student_name)}*.\n\n"
             f"Send it as: `<points> <reason text>` — e.g. `2 Disrupting class`",
             parse_mode="Markdown",
         )
