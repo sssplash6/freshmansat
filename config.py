@@ -13,8 +13,40 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-CREDENTIALS_FILE = BASE_DIR / "credentials.json"
+
+
+# --- Credentials: written to the persistent disk from an env var at startup,
+# so deployment never requires manually shelling in to place the file. See
+# _write_credentials_from_env() below, called once at import time.
+CREDENTIALS_FILE = Path(os.getenv("CREDENTIALS_FILE_PATH", str(BASE_DIR / "credentials.json")))
+
+
+def _write_credentials_from_env():
+    """If CREDENTIALS_JSON_B64 is set (Render deployment) and the target
+    file doesn't already exist, decode it and write it to CREDENTIALS_FILE.
+    Safe to call every startup — does nothing if the file's already there
+    (e.g. running locally with a real credentials.json already in place, or
+    a Render restart where the disk already has it from a previous boot).
+    """
+    if CREDENTIALS_FILE.exists():
+        return
+    encoded = os.getenv("CREDENTIALS_JSON_B64", "").strip()
+    if not encoded:
+        return
+    import base64
+    try:
+        CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CREDENTIALS_FILE.write_bytes(base64.b64decode(encoded))
+    except Exception as exc:
+        print(f"WARNING: failed to write credentials.json from CREDENTIALS_JSON_B64: {exc}")
+
+
+_write_credentials_from_env()
+
+
 PAYME_QR_FILE = BASE_DIR / "payme_qr.png"
+
+
 
 # --- Secrets / env ---------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
