@@ -26,9 +26,9 @@ STRIPE_LINKS = {
 # Admin's personal Telegram chat_id — payment-proof photos are forwarded here.
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
-ADMIN_PANEL_SHEET_ID = "1c9OF_Fwsyh9qTYwgLn1BzS42Y1fyvXEhnn2lhTOetzo"
+ADMIN_PANEL_SHEET_ID = "1BdPzPXXF15LswLlyQOotlWyqZyPRaQcUodKndoTqXxE"
 # --- Google Sheet ----------------------------------------------------------
-SHEET_ID = "1hvhQrigI1xwOxQ-n38n34jC38DoAJk3upEQjCgShG_k"
+SHEET_ID = "1c9OF_Fwsyh9qTYwgLn1BzS42Y1fyvXEhnn2lhTOetzo"
 SUPPRESS_STUDENT_MESSAGES = os.getenv("SUPPRESS_STUDENT_MESSAGES", "true").lower() == "true"
 
 

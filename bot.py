@@ -685,22 +685,41 @@ async def proof_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, _, target_username = query.data.partition(":")
     bd_entry = await asyncio.to_thread(sheets.find_bot_data_row, target_username)
 
+    base_caption = query.message.caption or ""
+
     if not bd_entry or not bd_entry.get("chat_id"):
-        await query.edit_message_caption(caption=query.message.caption + "\n\n⚠️ No linked chat found.")
+        await query.edit_message_caption(caption=base_caption + "\n\n⚠️ No linked chat found.")
         return
 
     if action == "reject":
         await asyncio.to_thread(sheets.clear_payment_proof, target_username)
         await notify_student(context.bot, int(bd_entry["chat_id"]), text=messages.proof_rejected())
-        await query.edit_message_caption(caption=query.message.caption + "\n\n❌ Rejected")
+        await query.edit_message_caption(caption=base_caption + "\n\n❌ Rejected")
 
     elif action == "approve":
         success, _ = await approve_payment(context.bot, target_username, source="proof")
         suffix = "\n\n✅ Approved" if success else "\n\n⚠️ Approval failed — check logs."
-        await query.edit_message_caption(caption=query.message.caption + suffix)
+        await query.edit_message_caption(caption=base_caption + suffix)
 
 async def approve_payment(bot, target_username: str, source: str) -> tuple[bool, str]:
     return await set_payment_status(bot, target_username, "Paid", source=source)
+
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Catches anything that slips past individual handler try/excepts, logs
+    it, and — if we can identify the admin's chat — pings them so a silent
+    failure doesn't go unnoticed."""
+    log.exception("Unhandled exception while processing update: %s", update, exc_info=context.error)
+    if config.ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=config.ADMIN_CHAT_ID,
+                text=f"⚠️ Bot error: {type(context.error).__name__}: {context.error}",
+            )
+        except Exception:
+            pass  # don't let error-reporting itself crash the bot
+
 
 async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
@@ -883,24 +902,25 @@ async def attendance_back_to_groups_callback(update: Update, context: ContextTyp
 
 
 def _build_attendance_keyboard(students: list, marks: dict) -> list:
-    """One row per student. Unmarked: name label + 4 status buttons.
-    Marked: name label + chosen status + a Change button. Submit/Back
-    always sit in their own rows at the end."""
+    """Two rows per student: a full-width name row, then either the 4 status
+    buttons (unmarked) or the chosen status + Change button (marked). This
+    keeps names fully readable instead of being squeezed by 5 buttons sharing
+    one row."""
     buttons = []
     for idx, student in enumerate(students):
-        name_short = student["name"][:20]
+        buttons.append([InlineKeyboardButton(f"👤 {student['name']}", callback_data="noop")])
+
         status = marks.get(idx)
         if status:
             emoji = _STATUS_EMOJI.get(status, "❓")
             buttons.append([
-                InlineKeyboardButton(name_short, callback_data="noop"),
                 InlineKeyboardButton(f"{emoji} {status}", callback_data="noop"),
                 InlineKeyboardButton("↩️ Change", callback_data=f"attendance_change:{idx}"),
             ])
         else:
-            row = [InlineKeyboardButton(name_short, callback_data="noop")]
+            row = []
             for s in _STATUS_ORDER:
-                row.append(InlineKeyboardButton(_STATUS_EMOJI[s], callback_data=f"attendance_mark:{idx}:{s}"))
+                row.append(InlineKeyboardButton(f"{_STATUS_EMOJI[s]} {s}", callback_data=f"attendance_mark:{idx}:{s}"))
             buttons.append(row)
 
     marked_count = len(marks)
@@ -1098,7 +1118,7 @@ def main():
     app.add_handler(CallbackQueryHandler(attendance_back_to_groups_callback, pattern=r"^attendance:back_to_groups$"))
     app.add_handler(CallbackQueryHandler(attendance_cancel_callback, pattern=r"^attendance:cancel$"))
     app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
-    
+    app.add_error_handler(error_handler)
     app.add_handler(CallbackQueryHandler(admin_menu_callback, pattern=r"^admin_menu:"))
     app.add_handler(CallbackQueryHandler(admin_group_callback, pattern=r"^admin_group:"))
     app.add_handler(CallbackQueryHandler(admin_pick_student_callback, pattern=r"^admin_pick:"))
@@ -1108,7 +1128,7 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_removepenalty_row_callback, pattern=r"^admin_removepenalty_row:"))
     app.add_handler(CallbackQueryHandler(admin_setpayment_status_callback, pattern=r"^admin_setpayment_status:"))
     app.add_handler(CallbackQueryHandler(admin_setpayment_pick_callback, pattern=r"^admin_setpayment_pick:"))
-    app.add_handler(CallbackQueryHandler(proof_decision))
+    app.add_handler(CallbackQueryHandler(proof_decision, pattern=r"^(approve|reject):"))
     app.add_handler(CallbackQueryHandler(admin_setpayment_execute_callback, pattern=r"^admin_setpayment_execute:"))
 
     # Plain-text replies during a guided admin flow (search query, custom
