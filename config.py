@@ -26,10 +26,10 @@ STRIPE_LINKS = {
 # Admin's personal Telegram chat_id — payment-proof photos are forwarded here.
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
-ADMIN_PANEL_SHEET_ID = "1BdPzPXXF15LswLlyQOotlWyqZyPRaQcUodKndoTqXxE"
+ADMIN_PANEL_SHEET_ID = "1c9OF_Fwsyh9qTYwgLn1BzS42Y1fyvXEhnn2lhTOetzo"
 # --- Google Sheet ----------------------------------------------------------
 SHEET_ID = "1hvhQrigI1xwOxQ-n38n34jC38DoAJk3upEQjCgShG_k"
-SUPPRESS_STUDENT_MESSAGES = True   # flip to False only when ready to go live
+SUPPRESS_STUDENT_MESSAGES = os.getenv("SUPPRESS_STUDENT_MESSAGES", "true").lower() == "true"
 
 
 # Tabs that are NOT student groups and must always be skipped.
@@ -73,7 +73,7 @@ BD_PAY_SHOWN = "Payment Info Shown"
 
 # Statuses that mean "no reminder needed".
 PAID_STATUSES = {"paid", "scholarship"}
-
+NO_REMINDER_STATUSES = {"paid", "scholarship", "cancel"}
 # --- Penalty Tracker Sheet (separate spreadsheet) ---------------------------
 # NOTE: double-check this ID against the real Penalty Tracker sheet's URL
 # before relying on it — it was picked up from a Google error message rather

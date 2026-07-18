@@ -113,6 +113,53 @@ def _is_paid(status: str) -> bool:
     return status.strip().lower() in config.PAID_STATUSES
 
 
+async def send_manual_reminder(bot, username: str) -> tuple[bool, str]:
+    """Send a single reminder to one student on demand (e.g. from the admin
+    panel's 'Send reminder' button), sharing the exact same reminder-number
+    escalation, Send Log entry, and pay_shown marking as the scheduled
+    run_reminders() job — so a manual send counts toward the same escalation
+    sequence instead of skipping it.
+    """
+    rec = await asyncio.to_thread(sheets.find_student, username)
+    if not rec:
+        return False, f"No student record found for @{username}."
+
+    if _is_paid(rec["status"]):
+        return False, f"{rec['name']} is already marked {rec['status']} — no reminder needed."
+
+    key = sheets.normalize_username(username)
+    bd_entry = await asyncio.to_thread(sheets.find_bot_data_row, username)
+
+    if not bd_entry or not str(bd_entry.get("chat_id", "")).strip():
+        await asyncio.to_thread(
+            sheets.append_send_log,
+            rec["group"], rec["name"], rec["tg"], "no chat_id found (manual)", "",
+        )
+        return False, f"{rec['name']} has no linked Telegram chat — can't send a reminder."
+
+    reminder_number = await asyncio.to_thread(sheets.count_sent, username) + 1
+    caption = messages.reminder_text(rec["name"], rec["amount"], reminder_number)
+
+    try:
+        with open(config.PAYME_QR_FILE, "rb") as photo:
+            await notify_student(bot, int(bd_entry["chat_id"]), photo=photo, caption=caption)
+    except Exception as exc:
+        log.warning("Manual reminder to %s failed: %s", username, exc)
+        await asyncio.to_thread(
+            sheets.append_send_log,
+            rec["group"], rec["name"], rec["tg"], f"error: {exc} (manual)", "",
+        )
+        return False, f"Failed to send reminder to {rec['name']}: {exc}"
+
+    log_result = "sent (manual)" if not config.SUPPRESS_STUDENT_MESSAGES else "suppressed (test mode, manual)"
+    await asyncio.to_thread(
+        sheets.append_send_log,
+        rec["group"], rec["name"], rec["tg"], log_result, reminder_number,
+    )
+    await asyncio.to_thread(sheets.mark_pay_shown, username)
+
+    return True, f"Reminder #{reminder_number} sent to {rec['name']}."
+
 async def run_reminders(bot):
     """Send an escalating payment reminder to every student who still owes."""
     log.info("Reminder job: starting")
@@ -123,7 +170,7 @@ async def run_reminders(bot):
     sent = skipped = no_chat = errors = 0
 
     for rec in records:
-        if _is_paid(rec["status"]):
+        if _skip_reminder(rec["status"]):
             skipped += 1
             continue
         if not rec["tg"].strip():
@@ -175,6 +222,12 @@ async def run_reminders(bot):
         sent, no_chat, errors, skipped, config.SUPPRESS_STUDENT_MESSAGES,
     )
 
+def _is_paid(status: str) -> bool:
+    return status.strip().lower() in config.PAID_STATUSES
+
+
+def _skip_reminder(status: str) -> bool:
+    return status.strip().lower() in config.NO_REMINDER_STATUSES
 
 async def run_payment_check(bot):
     """Thank students whose status just changed to Paid/Scholarship."""

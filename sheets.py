@@ -200,14 +200,44 @@ def iter_group_records():
     return records
 
 
-def find_student(username):
-    """First group row whose TG Contact matches ``username``, or None."""
-    target = normalize_username(username)
-    if not target:
-        return None
-    for rec in iter_group_records():
-        if normalize_username(rec["tg"]) == target:
-            return rec
+def find_student(query):
+    """Find a student row in the payment sheet, matching flexibly so minor
+    TG-handle drift between the payment sheet and the Admin Panel Roster
+    doesn't cause a false 'not found'. Tries, in order:
+      1. Exact TG handle match (original behavior)
+      2. Exact student name match
+      3. Substring name match (either direction)
+      4. Substring TG handle match (either direction) — catches typos,
+         truncation, or a changed handle where one is a prefix of the other
+    Returns the first/best match, or None if nothing matches at all.
+    """
+    records = iter_group_records()
+    target_tg = normalize_username(query)
+    target_name = _norm(query).lower()
+
+    if target_tg:
+        for rec in records:
+            if normalize_username(rec["tg"]) == target_tg:
+                return rec
+
+    if target_name:
+        for rec in records:
+            if rec["name"].strip().lower() == target_name:
+                return rec
+
+        contains = [
+            r for r in records
+            if target_name in r["name"].lower() or r["name"].lower() in target_name
+        ]
+        if contains:
+            return contains[0]
+
+    if target_tg:
+        for rec in records:
+            rec_tg = normalize_username(rec["tg"])
+            if rec_tg and (rec_tg in target_tg or target_tg in rec_tg):
+                return rec
+
     return None
 
 
@@ -327,8 +357,13 @@ def register_user(username, chat_id):
     ws.append_row(new_row, value_input_option="USER_ENTERED")
     return "created"
 
-def set_status_paid(ws, row_number):
-    """Set Status to 'Paid' and Date of Payment to today, for a specific row."""
+def set_student_status(ws, row_number, status_label):
+    """Set Status for a specific row to one of: 'Paid', 'Scholarship',
+    'Pending', 'Cancel'. Date of Payment is only touched when moving TO
+    Paid or Scholarship — it's deliberately never cleared on Pending/Cancel,
+    so a historical record of when they last paid survives even if their
+    status is later reverted.
+    """
     values = ws.get_all_values()
     header_i = _detect_header_row(values, (config.COL_STATUS, config.COL_DATE_OF_PAYMENT))
     headers = values[header_i]
@@ -337,27 +372,9 @@ def set_status_paid(ws, row_number):
     date_col = _header_index(headers, config.COL_DATE_OF_PAYMENT)
 
     if status_col is not None:
-        ws.update_cell(row_number, status_col + 1, "Paid")
-    if date_col is not None:
+        ws.update_cell(row_number, status_col + 1, status_label)
+    if status_label.strip().lower() in ("paid", "scholarship") and date_col is not None:
         ws.update_cell(row_number, date_col + 1, today_str())
-
-
-def set_status_unpaid(ws, row_number):
-    """Set Status to 'Unpaid' for a specific row.
-
-    Counterpart to set_status_paid, used only by the admin-override path
-    (/admin_setpayment ... unpaid) — there's no inline button for this since
-    the normal proof-approval flow only ever moves a student TO Paid.
-    Deliberately does not clear Date of Payment, so a historical record of
-    when they last paid is preserved even if their status is later reverted.
-    """
-    values = ws.get_all_values()
-    header_i = _detect_header_row(values, (config.COL_STATUS,))
-    headers = values[header_i]
-
-    status_col = _header_index(headers, config.COL_STATUS)
-    if status_col is not None:
-        ws.update_cell(row_number, status_col + 1, "Unpaid")
 
 
 # --- Payment_Log tab (Admin Panel spreadsheet) ------------------------------
@@ -441,7 +458,7 @@ def get_sent_counts():
     _, _, rows = _read(_send_log_ws(), _SL_COLS)
     counts: dict = {}
     for row in rows:
-        if row[config.SL_RESULT].strip().lower() == "sent":
+        if row[config.SL_RESULT].strip().lower().startswith("sent"):
             u = normalize_username(row[config.SL_TG_CONTACT])
             if u:
                 counts[u] = counts.get(u, 0) + 1
@@ -449,16 +466,16 @@ def get_sent_counts():
 
 
 def count_sent(username):
-    """How many successful ('sent') reminders this user already received."""
+    """How many successful ('sent' or 'sent (manual)') reminders this user
+    already received."""
     target = normalize_username(username)
     _, _, rows = _read(_send_log_ws(), _SL_COLS)
     return sum(
         1
         for row in rows
         if normalize_username(row[config.SL_TG_CONTACT]) == target
-        and row[config.SL_RESULT].strip().lower() == "sent"
+        and row[config.SL_RESULT].strip().lower().startswith("sent")
     )
-
 
 def append_send_log(group_tab, student_name, tg_contact, result, reminder_number):
     ws = _send_log_ws()
@@ -840,4 +857,202 @@ def find_penalty_record(username):
                 "class": get(config.PL_CLASS),
                 "points": get(config.PL_TOTAL_POINTS),
             }
+
+
+# --- Attendance Marking (Teacher UI) ----------------------------------------
+
+def get_students_for_group(group_name: str) -> list:
+    """Get all students in a group from Roster, returning [{name, tg}]."""
+    ws = get_admin_panel_spreadsheet().worksheet("Roster")
+    values = ws.get_all_values()
+    if not values:
+        return []
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in ("Student Name", "TG Handle", "Group")}
+    students = []
+    for raw in values[1:]:
+        def get(col):
+            i = idx.get(col)
+            return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
+        if get("Group") == group_name:
+            name = get("Student Name")
+            if name:
+                students.append({"name": name, "tg": get("TG Handle")})
+    return students
+
+
+def get_attendance_for_date_group(date_str: str, group_name: str) -> dict:
+    """Get attendance status for all students in a group on a specific date.
+    Returns {student_name: status} where status is 'Present', 'Late', 'Absent', 'Excused', or ''.
+    """
+    try:
+        ss = get_admin_panel_spreadsheet()
+        tab_name = f"Attendance - {group_name}"
+        ws = ss.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        return {}
+
+    try:
+        values = ws.get_all_values()
+        if not values or len(values) < 2:
+            return {}
+
+        headers = values[0]
+        
+        # Find the column for this date
+        date_col_idx = None
+        for i, header in enumerate(headers):
+            if date_str in str(header):
+                date_col_idx = i
+                break
+        
+        if date_col_idx is None:
+            return {}
+        
+        # Build result: {student_name: status}
+        result = {}
+        for row in values[1:]:
+            student_name = _norm(row[0]) if row else ""
+            if not student_name:
+                continue
+            status = _norm(row[date_col_idx]) if date_col_idx < len(row) else ""
+            result[student_name] = status
+        
+        return result
+    except Exception as e:
+        print(f"Error reading attendance: {e}")
+        return {}
+
+
+def get_existing_attendance_dates(group_name: str) -> list:
+    """Get all existing attendance dates for a group (from column headers).
+    Returns a sorted list of YYYY-MM-DD strings, most recent first.
+    """
+    try:
+        ss = get_admin_panel_spreadsheet()
+        tab_name = f"Attendance - {group_name}"
+        ws = ss.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        return []
+
+    try:
+        values = ws.get_all_values()
+        if not values:
+            return []
+
+        headers = values[0]
+        dates = []
+        
+        # Extract dates from headers (skip first 2: Student Name, TG Handle)
+        for i, header in enumerate(headers[2:], start=2):
+            header_str = str(header).strip()
+            if not header_str:
+                continue
+            # Try to extract YYYY-MM-DD format
+            # Date objects often come as "Sat Aug 15 2026 00:00:00 GMT+0500 ..."
+            # Try to find YYYY-MM-DD in the string
+            import re
+            match = re.search(r'(\d{4})-(\d{2})-(\d{2})', header_str)
+            if match:
+                date_str = match.group(0)
+                dates.append(date_str)
+            # Also check if it looks like a date in other formats
+            elif len(header_str) >= 10 and any(c.isdigit() for c in header_str):
+                # Try parsing as a date object representation
+                try:
+                    # This handles "Sat Aug 15 2026 00:00:00 GMT+0500" format
+                    if "2026" in header_str or "2025" in header_str or "2024" in header_str:
+                        import re
+                        # Extract year-month-day
+                        year_match = re.search(r'(202\d)', header_str)
+                        month_day = re.search(r'([A-Za-z]+)\s+(\d+)', header_str)
+                        if year_match and month_day:
+                            month_map = {"Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04", "May": "05", "Jun": "06",
+                                       "Jul": "07", "Aug": "08", "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12"}
+                            month = month_map.get(month_day.group(1), "")
+                            day = month_day.group(2).zfill(2)
+                            if month:
+                                date_str = f"{year_match.group(1)}-{month}-{day}"
+                                dates.append(date_str)
+                except Exception:
+                    pass
+        
+        # Sort descending (most recent first)
+        dates = sorted(set(dates), reverse=True)
+        return dates
+    except Exception as e:
+        print(f"Error getting dates: {e}")
+        return []
+
+def get_last_session_date(group_name: str) -> str | None:
+    """Most recent past attendance date for a group, or None if there isn't one.
+
+    Just the first entry of get_existing_attendance_dates() filtered to
+    strictly-before-today, since that function already returns dates sorted
+    most-recent-first.
+    """
+    today = today_str()
+    dates = [d for d in get_existing_attendance_dates(group_name) if d < today]
+    return dates[0] if dates else None
+
+def mark_attendance(date_str: str, group_name: str, student_name: str, status: str) -> bool:
+    """Mark attendance directly in 'Attendance - <Group>' tab.
+    
+    Creates the date column if it doesn't exist, finds the student row, and
+    sets the status. Returns True if successful.
+    
+    Args:
+        date_str: YYYY-MM-DD format
+        group_name: e.g. "Padawan Offline"
+        student_name: exact student name from Roster
+        status: one of "Present", "Late", "Absent", "Excused"
+    """
+    try:
+        ss = get_admin_panel_spreadsheet()
+        tab_name = f"Attendance - {group_name}"
+        ws = ss.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        return False
+
+    try:
+        # Get all data
+        values = ws.get_all_values()
+        if not values:
+            return False
+
+        # Row 1 is headers: "Student Name", "TG Handle", then dates...
+        headers = values[0]
+        
+        # Find or create the date column
+        date_col_idx = None
+        for i, header in enumerate(headers):
+            # Match YYYY-MM-DD anywhere in the header (handles Date object strings)
+            if date_str in str(header):
+                date_col_idx = i
+                break
+        
+        if date_col_idx is None:
+            # Column doesn't exist — add it
+            # First, find which column to add (after TG Handle)
+            new_col_idx = len(headers)
+            # Append the date as a new column header using gspread's date formatting
+            ws.update_cell(1, new_col_idx + 1, date_str)
+            date_col_idx = new_col_idx
+        
+        # Find the student row
+        student_row_idx = None
+        for i, row in enumerate(values[1:], start=2):  # Rows are 1-indexed in gspread
+            if _norm(row[0]) == _norm(student_name):
+                student_row_idx = i
+                break
+        
+        if student_row_idx is None:
+            return False
+        
+        # Mark the status in the sheet (1-indexed)
+        ws.update_cell(student_row_idx, date_col_idx + 1, status)
+        return True
+    except Exception as e:
+        print(f"Error marking attendance: {e}")
+        return False
     return None
