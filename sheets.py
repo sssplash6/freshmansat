@@ -330,8 +330,13 @@ def register_user(username, chat_id):
     ws.append_row(new_row, value_input_option="USER_ENTERED")
     return "created"
 
-def set_status_paid(ws, row_number):
-    """Set Status to 'Paid' and Date of Payment to today, for a specific row."""
+def set_finance_status(ws, row_number, status):
+    """Sets Status for a specific row in a Finance group tab to any value
+    (Paid, Pending, Scholarship, Cancelled, etc.) — replaces the old
+    Paid-only / Unpaid-only functions with one generic write. Only updates
+    Date of Payment when the new status is Paid, so a historical record of
+    when they last paid is preserved even if status later changes again.
+    """
     values = ws.get_all_values()
     header_i = _detect_header_row(values, (config.COL_STATUS, config.COL_DATE_OF_PAYMENT))
     headers = values[header_i]
@@ -340,27 +345,38 @@ def set_status_paid(ws, row_number):
     date_col = _header_index(headers, config.COL_DATE_OF_PAYMENT)
 
     if status_col is not None:
-        ws.update_cell(row_number, status_col + 1, "Paid")
-    if date_col is not None:
+        ws.update_cell(row_number, status_col + 1, status)
+    if status.strip().lower() == "paid" and date_col is not None:
         ws.update_cell(row_number, date_col + 1, today_str())
 
 
-def set_status_unpaid(ws, row_number):
-    """Set Status to 'Unpaid' for a specific row.
+def add_finance_student(group_tab_name, name, tg_handle, amount, status="Pending"):
+    """Adds a new student row directly to a Finance group tab.
 
-    Counterpart to set_status_paid, used only by the admin-override path
-    (/admin_setpayment ... unpaid) — there's no inline button for this since
-    the normal proof-approval flow only ever moves a student TO Paid.
-    Deliberately does not clear Date of Payment, so a historical record of
-    when they last paid is preserved even if their status is later reverted.
+    This is what makes a newly-added student actually payable/findable —
+    Roster (Admin Panel) and Finance (this spreadsheet's group tabs) are
+    two separate systems by design (Finance stays untouched structurally),
+    so adding someone to Roster alone does NOT make them exist in Finance.
+    This function is the other half of student creation.
+
+    group_tab_name must exactly match an existing tab title in this
+    spreadsheet (e.g. "Padawan Offline") — raises WorksheetNotFound if not.
     """
+    ws = get_spreadsheet().worksheet(group_tab_name)
     values = ws.get_all_values()
-    header_i = _detect_header_row(values, (config.COL_STATUS,))
-    headers = values[header_i]
+    cols = (config.COL_NAME, config.COL_TG, config.COL_AMOUNT, config.COL_STATUS)
+    header_i = _detect_header_row(values, cols) if values else 0
+    headers = values[header_i] if values else list(cols)
+    row = _build_row(headers, {
+        config.COL_NAME: name,
+        config.COL_TG: normalize_username(tg_handle),
+        config.COL_AMOUNT: amount,
+        config.COL_STATUS: status,
+    })
+    ws.append_row(row, value_input_option="USER_ENTERED")
 
-    status_col = _header_index(headers, config.COL_STATUS)
-    if status_col is not None:
-        ws.update_cell(row_number, status_col + 1, "Unpaid")
+
+
 
 
 # --- Payment_Log tab (Admin Panel spreadsheet) ------------------------------
@@ -373,7 +389,7 @@ def log_payment_change(student_name, username, new_status, source, amount=""):
 
     This is the ONLY thing the Admin Panel (Apps Script side) ever reads for
     payment history — it never touches the Finance sheet directly. Called
-    from bot.py's approve_payment() and set_unpaid(), always alongside the
+    from bot.py's set_payment_status(), always alongside the
     Finance sheet write, so the two can never drift apart.
 
     source: 'proof' (student-submitted photo, admin tapped Approve) or
