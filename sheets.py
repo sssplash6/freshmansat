@@ -351,20 +351,27 @@ def set_finance_status(ws, row_number, status):
 
 
 def add_finance_student(group_tab_name, name, tg_handle, amount, status="Pending"):
-    """Adds a new student row directly to a Finance group tab.
+    """Adds a new student row directly to a Finance group tab — creating
+    that tab (with proper headers) first if it doesn't exist yet, so this
+    never fails to write just because a group tab hasn't been set up in
+    Finance yet.
 
     This is what makes a newly-added student actually payable/findable —
     Roster (Admin Panel) and Finance (this spreadsheet's group tabs) are
-    two separate systems by design (Finance stays untouched structurally),
-    so adding someone to Roster alone does NOT make them exist in Finance.
-    This function is the other half of student creation.
-
-    group_tab_name must exactly match an existing tab title in this
-    spreadsheet (e.g. "Padawan Offline") — raises WorksheetNotFound if not.
+    two separate systems by design, so adding someone to Roster alone does
+    NOT make them exist in Finance. This function is the other half of
+    student creation.
     """
-    ws = get_spreadsheet().worksheet(group_tab_name)
-    values = ws.get_all_values()
-    cols = (config.COL_NAME, config.COL_TG, config.COL_AMOUNT, config.COL_STATUS)
+    ss = get_spreadsheet()
+    cols = (config.COL_NAME, config.COL_TG, config.COL_AMOUNT, config.COL_STATUS, config.COL_DATE_OF_PAYMENT)
+    try:
+        ws = ss.worksheet(group_tab_name)
+        values = ws.get_all_values()
+    except gspread.exceptions.WorksheetNotFound:
+        ws = ss.add_worksheet(title=group_tab_name, rows=200, cols=len(cols))
+        ws.append_row(list(cols))
+        values = ws.get_all_values()
+
     header_i = _detect_header_row(values, cols) if values else 0
     headers = values[header_i] if values else list(cols)
     row = _build_row(headers, {
@@ -374,6 +381,10 @@ def add_finance_student(group_tab_name, name, tg_handle, amount, status="Pending
         config.COL_STATUS: status,
     })
     ws.append_row(row, value_input_option="USER_ENTERED")
+
+    # Clear the cached worksheet lookup so future find_student()/iter_group_records()
+    # calls see the row we just added.
+    _ws_cache.pop(group_tab_name, None)
 
 
 
@@ -703,30 +714,51 @@ def get_roster_by_group(group_name):
 
 
 def add_roster_student(name, tg_handle, group):
-    """Adds a new student to Roster (Status: active), and — if that group's
-    attendance entry tab exists — appends them there too so the teacher can
-    start marking them from the next session.
+    """Adds a student to Roster for a given group (Status: active).
+
+    If a row for this exact name+group already exists — even if it's
+    currently inactive (soft-deleted) — that row is REACTIVATED (status set
+    back to active, TG handle refreshed) instead of appending a duplicate.
+    This is what makes "remove student" then "add student" again behave
+    like undo, rather than leaving two rows for the same enrollment.
+
+    Also appends them to that group's attendance entry tab if they're not
+    already listed there, so the teacher can start marking them.
     """
     ss = get_admin_panel_spreadsheet()
     roster_ws = ss.worksheet("Roster")
-    headers = roster_ws.row_values(1)
-    row = [""] * len(headers)
-    values_map = {
-        "student name": name,
-        "tg handle": tg_handle,
-        "group": group,
-        "status": "active",
-    }
-    for i, h in enumerate(headers):
-        key = h.strip().lower()
-        if key in values_map:
-            row[i] = values_map[key]
-    roster_ws.append_row(row, value_input_option="USER_ENTERED")
+
+    existing = [r for r in get_roster_rows(include_inactive=True) if r["name"] == name and r["group"] == group]
+    if existing:
+        row_number = existing[0]["row_number"]
+        headers = roster_ws.row_values(1)
+        status_col = _header_index(headers, "Status")
+        tg_col = _header_index(headers, "TG Handle")
+        if status_col is not None:
+            roster_ws.update_cell(row_number, status_col + 1, "active")
+        if tg_col is not None and tg_handle:
+            roster_ws.update_cell(row_number, tg_col + 1, tg_handle)
+    else:
+        headers = roster_ws.row_values(1)
+        row = [""] * len(headers)
+        values_map = {
+            "student name": name,
+            "tg handle": tg_handle,
+            "group": group,
+            "status": "active",
+        }
+        for i, h in enumerate(headers):
+            key = h.strip().lower()
+            if key in values_map:
+                row[i] = values_map[key]
+        roster_ws.append_row(row, value_input_option="USER_ENTERED")
 
     attendance_tab_name = f"Attendance - {group}"
     try:
         attendance_ws = ss.worksheet(attendance_tab_name)
-        attendance_ws.append_row([name, tg_handle], value_input_option="USER_ENTERED")
+        existing_names = [r[0] for r in attendance_ws.get_all_values()[1:]] if attendance_ws.row_count > 1 else []
+        if name not in existing_names:
+            attendance_ws.append_row([name, tg_handle], value_input_option="USER_ENTERED")
     except gspread.exceptions.WorksheetNotFound:
         log.warning(
             "add_roster_student: no attendance tab '%s' found — student added to "
@@ -883,8 +915,19 @@ def get_student_profile(student_name):
     if not matching_rows:
         return None
 
-    tg = next((r["tg"] for r in matching_rows if r["tg"]), "")
-    groups = [r["group"] for r in matching_rows if r["group"]]
+    active_rows = [r for r in matching_rows if r["status"].lower() == "active"]
+    # Prefer active rows for display — an old inactive duplicate shouldn't
+    # override a genuinely active enrollment (e.g. remove-then-re-add).
+    display_rows = active_rows if active_rows else matching_rows
+    tg = next((r["tg"] for r in display_rows if r["tg"]), "")
+    # Dedupe group names while preserving order (a student can legitimately
+    # be in the same group only once, but defensive against stale duplicates).
+    seen_groups = []
+    for r in display_rows:
+        if r["group"] and r["group"] not in seen_groups:
+            seen_groups.append(r["group"])
+    groups = seen_groups
+    roster_status = "active" if active_rows else (matching_rows[-1]["status"] if matching_rows else "unknown")
 
     ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
     values = ws.get_all_values()
@@ -921,7 +964,7 @@ def get_student_profile(student_name):
         "name": student_name,
         "tg": tg,
         "group": ", ".join(groups) if groups else "",
-        "roster_status": matching_rows[0]["status"] if matching_rows else "unknown",
+        "roster_status": roster_status,
         "attendance": attendance_counts,
         "homework": homework_counts,
         "total_points": total_points,
