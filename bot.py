@@ -653,7 +653,7 @@ async def admin_setpayment_pick_callback(update: Update, context: ContextTypes.D
             "type": "setpayment_amount", "status": status,
             "target_username": target_username, "student_name": student_name,
         }
-        await safe_edit_text(query, f"How much has {student_name} paid so far?",
+        await safe_edit_text(query, f"How much {student_name} to pay?",
                               reply_markup=_amount_picker_keyboard("setpayment"))
         return
 
