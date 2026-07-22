@@ -9,6 +9,7 @@ Run:  ./venv/bin/python bot.py
 import asyncio
 import logging
 
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -22,13 +23,13 @@ from telegram.ext import (
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
-from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler
 import config
 import jobs
 import messages
 import sheets
 from notify import notify_student
+from telegram.helpers import escape_markdown
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -36,6 +37,7 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
+
 
 def is_admin_update(update: Update) -> bool:
     """True if this update is from the admin group OR from a whitelisted
@@ -50,30 +52,15 @@ def is_admin_update(update: Update) -> bool:
     return False
 
 
-async def safe_edit_text(query, text, **kwargs):
-    """Wraps query.edit_message_text, swallowing Telegram's harmless
-    'Message is not modified' BadRequest — this fires whenever an edit call
-    sends the exact same text+buttons the message already has (e.g. a
-    double-tap on a button before Telegram registers the first tap). Any
-    other BadRequest is re-raised since that could be a real problem.
-    """
-    try:
-        await query.edit_message_text(text, **kwargs)
-    except BadRequest as exc:
-        if "message is not modified" not in str(exc).lower():
-            raise
-
-
-async def safe_edit_caption(query, caption, **kwargs):
-    """Same as safe_edit_text, for edit_message_caption."""
-    try:
-        await query.edit_message_caption(caption=caption, **kwargs)
-    except BadRequest as exc:
-        if "message is not modified" not in str(exc).lower():
-            raise
-
-
 # --- Command handlers ------------------------------------------------------
+
+def _md(text: str) -> str:
+    """Escape a piece of dynamic text (student name, TG handle, group name,
+    etc.) so it's safe to interpolate into a parse_mode='Markdown' message.
+    """
+    return escape_markdown(text or "", version=1)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     username = user.username
@@ -130,24 +117,19 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = user.username
     chat_id = message.chat_id
 
-
     if not username:
         await message.reply_text(messages.welcome_no_username())
         return
 
-    # Match the sender against the group tabs (read-only).
     rec = await asyncio.to_thread(sheets.find_student, username)
     if not rec:
         await message.reply_text(messages.proof_no_record())
         return
 
-    # Largest available photo size is the last entry.
     file_id = message.photo[-1].file_id
     date_str = sheets.today_str()
 
     try:
-        # Forward the actual photo to the admin with context in the caption.
-        # (Re-sending by file_id needs no download.)
         if config.ADMIN_CHAT_ID:
             keyboard = InlineKeyboardMarkup([
                 [
@@ -166,7 +148,6 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             log.warning("ADMIN_CHAT_ID not set — proof not forwarded to admin")
 
-        # Ensure a Bot Data row exists, then record the submission there.
         await asyncio.to_thread(sheets.register_user, username, chat_id)
         await asyncio.to_thread(sheets.set_payment_proof, username, file_id, date_str)
     except Exception as exc:
@@ -176,7 +157,7 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Please try again shortly or contact the admin."
         )
         return
-   
+
     bd_entry = await asyncio.to_thread(sheets.find_bot_data_row, username)
     if not bd_entry or not bd_entry.get("pay_shown", "").strip():
         await message.reply_text(messages.proof_before_pay_info())
@@ -184,20 +165,11 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(messages.proof_received())
     log.info("Proof from @%s recorded (file_id=%s)", username, file_id)
 
-PAYMENT_STATUSES = ["Paid", "Pending", "Scholarship", "Cancelled"]
 
-
-async def set_payment_status(bot, target_username: str, status: str, source: str, amount=None) -> tuple[bool, str]:
-    """Single entry point for changing a student's payment status to ANY of
-    the real Finance-sheet values (Paid, Pending, Scholarship, Cancelled).
-
-    This is the ONLY place that writes payment status to the Finance sheet
-    — Apps Script never touches Finance directly. Every write here also
-    logs to Payment_Log in the Admin Panel spreadsheet, with `amount` when
-    given (e.g. a partial payment received while status is Pending) so the
-    admin panel has a full paper trail without needing Finance access.
-
-    Returns (success, message) for the caller to relay back to the admin.
+async def set_payment_status(bot, target_username: str, status_label: str, source: str) -> tuple[bool, str]:
+    """Single entry point for changing a student's payment status to any of
+    Paid / Scholarship / Pending / Cancel. This is the ONLY place that
+    writes payment status to the Finance sheet.
     """
     rec = await asyncio.to_thread(sheets.find_student, target_username)
     if not rec:
@@ -205,15 +177,14 @@ async def set_payment_status(bot, target_username: str, status: str, source: str
 
     bd_entry = await asyncio.to_thread(sheets.find_bot_data_row, target_username)
 
-    await asyncio.to_thread(sheets.set_finance_status, rec["worksheet"], rec["row_number"], status)
-    log_amount = amount if amount is not None else rec["amount"]
+    await asyncio.to_thread(sheets.set_student_status, rec["worksheet"], rec["row_number"], status_label)
     await asyncio.to_thread(
-        sheets.log_payment_change, rec["name"], target_username, status, source, log_amount
+        sheets.log_payment_change, rec["name"], target_username, status_label, source, rec["amount"]
     )
 
-    if bd_entry:
-        await asyncio.to_thread(sheets.update_last_known_status, bd_entry["row_number"], status)
-        if status.lower() == "paid" and bd_entry.get("chat_id"):
+    if bd_entry and bd_entry.get("chat_id"):
+        await asyncio.to_thread(sheets.update_last_known_status, bd_entry["row_number"], status_label)
+        if status_label.strip().lower() in config.PAID_STATUSES:
             try:
                 await notify_student(
                     bot, int(bd_entry["chat_id"]), text=messages.payment_success(rec["name"])
@@ -221,17 +192,13 @@ async def set_payment_status(bot, target_username: str, status: str, source: str
             except Exception as exc:
                 log.warning("Could not notify @%s of payment approval: %s", target_username, exc)
 
-    amount_note = f" (amount: {amount})" if amount is not None else ""
-    return True, f"Set @{target_username} ({rec['name']}) to {status}{amount_note}."
+    return True, f"Marked @{target_username} ({rec['name']}) as {status_label}."
 
 
 async def set_bot_commands(app: Application):
-    """Registers Telegram's native '/' autocomplete menu.
-
-    Students see one set of commands with plain-language descriptions (no
-    need to remember exact syntax — Telegram shows the description as they
-    type). The admin chat sees an additional set on top, scoped so no other
-    chat can see or use them.
+    """Registers Telegram's native '/' autocomplete menu. Every admin
+    identity — the group AND each whitelisted admin user's private DM —
+    gets the admin command set, not just the group.
     """
     student_commands = [
         BotCommand("start", "Register with the bot"),
@@ -241,22 +208,26 @@ async def set_bot_commands(app: Application):
     ]
     await app.bot.set_my_commands(student_commands, scope=BotCommandScopeDefault())
 
+    admin_commands = student_commands + [
+        BotCommand("admin", "Open the admin menu"),
+        BotCommand("attendance", "Mark attendance"),
+        BotCommand("admin_setpayment", "Set a student's payment status directly"),
+        BotCommand("reject", "Reject a student's payment proof"),
+    ]
+    admin_chat_ids = set()
     if config.ADMIN_CHAT_ID:
-        admin_commands = student_commands + [
-            BotCommand("admin", "Open the admin menu"),
-            BotCommand("admin_setpayment", "Set a student's payment status directly"),
-            BotCommand("reject", "Reject a student's payment proof"),
-        ]
-        await app.bot.set_my_commands(
-            admin_commands,
-            scope=BotCommandScopeChat(chat_id=int(config.ADMIN_CHAT_ID)),
-        )
+        admin_chat_ids.add(int(config.ADMIN_CHAT_ID))
+    admin_chat_ids.update(config.ADMIN_USER_IDS)
+
+    for chat_id in admin_chat_ids:
+        try:
+            await app.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=chat_id))
+        except Exception as exc:
+            log.warning("Could not set admin commands for chat_id=%s: %s", chat_id, exc)
 
 
 # --- Guided admin menu (buttons instead of typed syntax) -------------------
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/admin — entry point to a button-driven menu, so the admin never has
-    to remember exact command syntax."""
     if not is_admin_update(update):
         return
 
@@ -264,9 +235,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💰 Set payment status", callback_data="admin_menu:setpayment")],
         [InlineKeyboardButton("📋 Browse roster", callback_data="admin_menu:browse")],
         [InlineKeyboardButton("🔍 Search student", callback_data="admin_menu:search")],
-        [InlineKeyboardButton("➕ Add student", callback_data="admin_menu:addstudent")],
-        [InlineKeyboardButton("➕ Add group", callback_data="admin_menu:addgroup")],
-        [InlineKeyboardButton("🗑 Remove group", callback_data="admin_menu:removegroup")],
+        [InlineKeyboardButton("✅ Mark attendance", callback_data="admin_menu:attendance")],
         [InlineKeyboardButton("❌ Cancel", callback_data="admin_menu:cancel")],
     ])
     await update.message.reply_text(
@@ -274,21 +243,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def _payment_status_keyboard(origin: str) -> InlineKeyboardMarkup:
-    """origin is 'search' (top-level menu — student not yet known, will need
-    to be found by name/username) or 'direct' (student already selected from
-    a profile card — act on them immediately, no search needed).
-    """
-    rows = [
-        [InlineKeyboardButton(status, callback_data=f"admin_setpayment_status:{status}:{origin}")]
-        for status in PAYMENT_STATUSES
-    ]
-    rows.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
 async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles taps on the /admin menu buttons and the payment-status sub-menu."""
     query = update.callback_query
     await query.answer()
 
@@ -299,83 +254,45 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if action == "cancel":
         context.user_data.pop("pending_admin_action", None)
-        await safe_edit_text(query, "Cancelled.")
+        await query.edit_message_text("Cancelled.")
         return
 
     if action == "setpayment":
-        await safe_edit_text(query, "Set status to:", reply_markup=_payment_status_keyboard("search"))
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Paid", callback_data="admin_setpayment_status:Paid"),
+                InlineKeyboardButton("🎓 Scholarship", callback_data="admin_setpayment_status:Scholarship"),
+            ],
+            [
+                InlineKeyboardButton("⏳ Pending", callback_data="admin_setpayment_status:Pending"),
+                InlineKeyboardButton("🚫 Cancel", callback_data="admin_setpayment_status:Cancel"),
+            ],
+            [InlineKeyboardButton("⬅️ Cancel menu", callback_data="admin_menu:cancel")],
+        ])
+        await query.edit_message_text("Set status to:", reply_markup=keyboard)
         return
 
     if action == "browse":
         groups = await asyncio.to_thread(sheets.get_groups_schedule)
         buttons = [[InlineKeyboardButton(g["name"], callback_data=f"admin_group:{g['name']}")] for g in groups]
         buttons.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
-        await safe_edit_text(query, "Pick a group:", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text("Pick a group:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if action == "search":
         context.user_data["pending_admin_action"] = {"type": "search_student"}
-        await safe_edit_text(query, "Send part of a student's name or @username to search for.")
+        await query.edit_message_text("Send part of a student's name or @username to search for.")
         return
 
-    if action == "addstudent":
-        context.user_data["pending_admin_action"] = {"type": "addstudent_name"}
-        await safe_edit_text(query, "New student — send their full name.")
-        return
-
-    if action == "addgroup":
-        context.user_data["pending_admin_action"] = {"type": "addgroup_name"}
-        await safe_edit_text(query, "New group — send the group name (e.g. \"Padawan Offline 2\").")
-        return
-
-    if action == "removegroup":
-        groups = await asyncio.to_thread(sheets.get_groups_schedule)
-        if not groups:
-            await safe_edit_text(query, "No groups found.")
-            return
-        buttons = [[InlineKeyboardButton(g["name"], callback_data=f"admin_removegroup_pick:{g['name']}")] for g in groups]
-        buttons.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
-        await safe_edit_text(query, 
-            "Pick a group to remove.\n\n"
-            "This only removes it from scheduling/syncing — students, attendance history, "
-            "and logs are kept untouched.",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+    if action == "attendance":
+        await _show_attendance_group_picker(query.edit_message_text)
         return
 
     if action.startswith("admin_setpayment_status"):
-        return  # handled by the dedicated callback below
-
-
-async def admin_removegroup_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirmation step before actually deleting a Groups row."""
-    query = update.callback_query
-    await query.answer()
-    if not is_admin_update(update):
         return
-    _, _, group_name = query.data.partition(":")
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Yes, remove it", callback_data=f"admin_removegroup_confirm:{group_name}")],
-        [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
-    ])
-    await safe_edit_text(query, f"Remove group *{group_name}*? This can't be undone from here.",
-                                   parse_mode="Markdown", reply_markup=keyboard)
-
-
-async def admin_removegroup_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin_update(update):
-        return
-    _, _, group_name = query.data.partition(":")
-    removed = await asyncio.to_thread(sheets.remove_group, group_name)
-    await safe_edit_text(query, 
-        f"Removed {group_name}." if removed else f"Couldn't find {group_name} — it may have already been removed."
-    )
 
 
 async def admin_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """After picking a group from Browse Roster, show its students as buttons."""
     query = update.callback_query
     await query.answer()
     if not is_admin_update(update):
@@ -384,16 +301,15 @@ async def admin_group_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     _, _, group_name = query.data.partition(":")
     students = await asyncio.to_thread(sheets.get_roster_by_group, group_name)
     if not students:
-        await safe_edit_text(query, f"No students found in {group_name}.")
+        await query.edit_message_text(f"No students found in {group_name}.")
         return
 
     buttons = [[InlineKeyboardButton(s["name"], callback_data=f"admin_pick:{s['name']}")] for s in students]
     buttons.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
-    await safe_edit_text(query, f"{group_name} — pick a student:", reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(f"{group_name} — pick a student:", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_pick_student_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """A student was picked (from browse or search) — show their action card."""
     query = update.callback_query
     await query.answer()
     if not is_admin_update(update):
@@ -407,24 +323,25 @@ async def admin_pick_student_callback(update: Update, context: ContextTypes.DEFA
         [InlineKeyboardButton("➕ Add penalty", callback_data="admin_action:addpenalty")],
         [InlineKeyboardButton("➖ Remove penalty", callback_data="admin_action:removepenalty")],
         [InlineKeyboardButton("💰 Set payment status", callback_data="admin_action:setpayment_direct")],
-        [InlineKeyboardButton("🚫 Remove student", callback_data="admin_action:removestudent")],
         [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
     ])
-    await safe_edit_text(query, f"*{student_name}* — what would you like to do?",
+    await query.edit_message_text(f"*{_md(student_name)}* — what would you like to do?",
                                    parse_mode="Markdown", reply_markup=keyboard)
 
 
 def _format_student_profile(profile: dict) -> str:
     payment = profile["payment"]
+    name = _md(profile['name'])
+    tg = _md(profile['tg'])
+    group = _md(profile['group'])
     payment_line = (
         f"{payment['status']} (amount: {payment['amount']}, as of {payment['timestamp']})"
         if payment else "No payment record yet"
     )
-    status_line = "" if profile.get("roster_status", "active").lower() == "active" else "\n🚫 *Status: inactive/removed*"
     return (
-        f"👤 *{profile['name']}*{status_line}\n"
-        f"Group: {profile['group']}\n"
-        f"TG: @{profile['tg']}\n\n"
+        f"👤 *{name}*\n"
+        f"Group: {group}\n"
+        f"TG: @{tg}\n\n"
         f"📅 Attendance — Present: {profile['attendance']['Present']}, "
         f"Late: {profile['attendance']['Late']}, Absent: {profile['attendance']['Absent']}\n"
         f"📚 Homework — On time: {profile['homework']['On Time']}, "
@@ -443,7 +360,6 @@ _PENALTY_PRESETS = {
 
 
 async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the per-student action card buttons (profile/add/remove/payment)."""
     query = update.callback_query
     await query.answer()
     if not is_admin_update(update):
@@ -451,7 +367,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     student_name = context.user_data.get("selected_student")
     if not student_name:
-        await safe_edit_text(query, "No student selected — start over with /admin.")
+        await query.edit_message_text("No student selected — start over with /admin.")
         return
 
     _, _, action = query.data.partition(":")
@@ -459,9 +375,16 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if action == "profile":
         profile = await asyncio.to_thread(sheets.get_student_profile, student_name)
         if not profile:
-            await safe_edit_text(query, f"No profile data found for {student_name}.")
+            await query.edit_message_text(f"No profile data found for {student_name}.")
             return
-        await safe_edit_text(query, _format_student_profile(profile), parse_mode="Markdown")
+        buttons = []
+        payment = profile.get("payment")
+        is_unpaid = (not payment) or (payment["status"].strip().lower() not in config.PAID_STATUSES)
+        if is_unpaid and profile.get("tg"):
+            buttons.append([InlineKeyboardButton("📨 Send reminder", callback_data=f"admin_sendreminder:{student_name}")])
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")])
+        await query.edit_message_text(_format_student_profile(profile), parse_mode="Markdown",
+                                       reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if action == "addpenalty":
@@ -471,75 +394,45 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("Late homework (-1)", callback_data="admin_penalty_preset:late_hw")],
             [InlineKeyboardButton("Missing homework (-3)", callback_data="admin_penalty_preset:missing_hw")],
             [InlineKeyboardButton("✏️ Custom (type points + reason)", callback_data="admin_penalty_preset:custom")],
-            [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")],
         ])
-        await safe_edit_text(query, f"Add penalty for *{student_name}* — pick a reason:",
+        await query.edit_message_text(f"Add penalty for *{_md(student_name)}* — pick a reason:",
                                        parse_mode="Markdown", reply_markup=keyboard)
         return
 
     if action == "removepenalty":
         penalties = await asyncio.to_thread(sheets.get_active_penalties, student_name)
         if not penalties:
-            await safe_edit_text(query, f"{student_name} has no active penalties.")
+            buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
+            await query.edit_message_text(f"{student_name} has no active penalties.",
+                                           reply_markup=InlineKeyboardMarkup(buttons))
             return
         buttons = [
             [InlineKeyboardButton(f"{p['reason']} (-{p['points']})", callback_data=f"admin_removepenalty_row:{p['row_number']}")]
             for p in penalties
         ]
-        buttons.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
-        await safe_edit_text(query, f"Remove which penalty for *{student_name}*?",
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")])
+        await query.edit_message_text(f"Remove which penalty for *{_md(student_name)}*?",
                                        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if action == "setpayment_direct":
-        await safe_edit_text(query, "Set status to:", reply_markup=_payment_status_keyboard("direct"))
-        return
-
-    if action == "removestudent":
-        rows = await asyncio.to_thread(sheets.get_roster_rows_for_student, student_name, False)
-        active_rows = [r for r in rows if r["status"].lower() == "active"]
-        if not active_rows:
-            await safe_edit_text(query, f"{student_name} has no active roster entries to remove.")
-            return
-        if len(active_rows) == 1:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Yes, remove", callback_data=f"admin_removestudent_confirm:{active_rows[0]['row_number']}")],
-                [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
-            ])
-            await safe_edit_text(query, 
-                f"Remove *{student_name}* from {active_rows[0]['group']}?\n\n"
-                f"This keeps all their history (attendance, homework, penalties, payments) — "
-                f"it just marks them inactive so they stop showing up in browse/search and stop "
-                f"getting reminders/alerts.",
-                parse_mode="Markdown", reply_markup=keyboard,
-            )
-        else:
-            # Multi-group student — let the admin remove them from one group
-            # specifically, rather than guessing which enrollment they mean.
-            buttons = [
-                [InlineKeyboardButton(f"Remove from {r['group']}", callback_data=f"admin_removestudent_confirm:{r['row_number']}")]
-                for r in active_rows
-            ]
-            buttons.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
-            await safe_edit_text(query, 
-                f"*{student_name}* is enrolled in multiple groups — remove from which one?",
-                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
-            )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Paid", callback_data="admin_setpayment_execute:Paid"),
+                InlineKeyboardButton("🎓 Scholarship", callback_data="admin_setpayment_execute:Scholarship"),
+            ],
+            [
+                InlineKeyboardButton("⏳ Pending", callback_data="admin_setpayment_execute:Pending"),
+                InlineKeyboardButton("🚫 Cancel", callback_data="admin_setpayment_execute:Cancel"),
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")],
+        ])
+        await query.edit_message_text("Set status to:", reply_markup=keyboard)
         return
 
 
-async def admin_removestudent_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin_update(update):
-        return
-    _, _, row_str = query.data.partition(":")
-    await asyncio.to_thread(sheets.set_student_status, int(row_str), "inactive")
-    await safe_edit_text(query, "Student removed (marked inactive — history preserved).")
-
-
-async def admin_penalty_preset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the preset-reason buttons under Add Penalty."""
+async def admin_setpayment_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not is_admin_update(update):
@@ -547,15 +440,63 @@ async def admin_penalty_preset_callback(update: Update, context: ContextTypes.DE
 
     student_name = context.user_data.get("selected_student")
     if not student_name:
-        await safe_edit_text(query, "No student selected — start over with /admin.")
+        await query.edit_message_text("No student selected — start over with /admin.")
+        return
+
+    _, _, status = query.data.partition(":")
+
+    rec = await asyncio.to_thread(sheets.find_student, student_name)
+    if not rec:
+        buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
+        await query.edit_message_text(
+            f"⚠️ No payment record found for {student_name} in the payment sheet at all — "
+            f"they may be missing a row there entirely.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    target_username = rec["tg"].lstrip("@")
+    success, msg = await set_payment_status(context.bot, target_username, status, source="admin_override")
+    result_msg = (f"✅ {msg}" if success else f"⚠️ {msg}")
+    buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
+    await query.edit_message_text(result_msg, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def admin_sendreminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+
+    _, _, student_name = query.data.partition(":")
+    profile = await asyncio.to_thread(sheets.get_student_profile, student_name)
+    if not profile or not profile.get("tg"):
+        await query.edit_message_text(f"{student_name} has no TG handle on file — can't send a reminder.")
+        return
+
+    success, msg = await jobs.send_manual_reminder(context.bot, profile["tg"].lstrip("@"))
+    result_msg = (f"✅ {msg}" if success else f"⚠️ {msg}")
+    buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
+    await query.edit_message_text(result_msg, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def admin_penalty_preset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+
+    student_name = context.user_data.get("selected_student")
+    if not student_name:
+        await query.edit_message_text("No student selected — start over with /admin.")
         return
 
     _, _, preset_key = query.data.partition(":")
 
     if preset_key == "custom":
         context.user_data["pending_admin_action"] = {"type": "addpenalty_custom", "student": student_name}
-        await safe_edit_text(query, 
-            f"Adding a custom penalty for *{student_name}*.\n\n"
+        await query.edit_message_text(
+            f"Adding a custom penalty for *{_md(student_name)}*.\n\n"
             f"Send it as: `<points> <reason text>` — e.g. `2 Disrupting class`",
             parse_mode="Markdown",
         )
@@ -564,82 +505,36 @@ async def admin_penalty_preset_callback(update: Update, context: ContextTypes.DE
     reason, points = _PENALTY_PRESETS[preset_key]
     profile = await asyncio.to_thread(sheets.get_student_profile, student_name)
     group = profile["group"] if profile else ""
-    await asyncio.to_thread(sheets.add_manual_penalty, student_name, group, reason, points, "Admin")
-    await safe_edit_text(query, f"Added: {reason} (-{points}) for {student_name}.")
+    try:
+        await asyncio.to_thread(sheets.add_manual_penalty, student_name, group, reason, points, "Admin")
+        msg = f"✅ Added: {reason} (-{points}) for {student_name}."
+    except Exception as e:
+        msg = f"⚠️ Error adding penalty: {str(e)}"
+
+    buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_removepenalty_row_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles tapping a specific penalty to remove."""
     query = update.callback_query
     await query.answer()
     if not is_admin_update(update):
         return
 
+    student_name = context.user_data.get("selected_student")
     _, _, row_str = query.data.partition(":")
-    await asyncio.to_thread(sheets.remove_admin_panel_penalty, int(row_str))
-    await safe_edit_text(query, "Penalty removed.")
 
-
-async def admin_addstudent_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Group was picked — now ask for the tuition amount before actually
-    writing anything, since creating the student needs both Roster AND a
-    Finance row (with an amount) to be usable end-to-end."""
-    query = update.callback_query
-    await query.answer()
-    if not is_admin_update(update):
-        return
-
-    pending = context.user_data.get("pending_admin_action")
-    if not pending or pending.get("type") != "addstudent_pick_group":
-        await safe_edit_text(query, "That selection expired — start over with /admin.")
-        return
-
-    _, _, group_name = query.data.partition(":")
-    context.user_data["pending_admin_action"] = {
-        "type": "addstudent_amount", "name": pending["name"], "tg": pending["tg"], "group": group_name,
-    }
-    await safe_edit_text(query, f"What's {pending['name']}'s tuition for {group_name}?",
-                          reply_markup=_amount_picker_keyboard("addstudent"))
-
-
-PRESET_AMOUNTS = {"89": 89, "119": 119}
-
-
-def _amount_picker_keyboard(purpose: str) -> InlineKeyboardMarkup:
-    """purpose is 'setpayment' (amount received toward a Pending balance) or
-    'addstudent' (tuition fee owed for a newly-added student)."""
-    rows = [
-        [
-            InlineKeyboardButton("$89", callback_data=f"admin_amount_preset:{purpose}:89"),
-            InlineKeyboardButton("$119", callback_data=f"admin_amount_preset:{purpose}:119"),
-        ],
-        [InlineKeyboardButton("✏️ Custom amount", callback_data=f"admin_amount_preset:{purpose}:custom")],
-        [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
-async def _finalize_addstudent(name: str, tg: str, group: str, amount) -> str:
-    """Creates the student in BOTH Roster (Admin Panel) and the Finance
-    group tab (with the given tuition amount, status starting Pending) —
-    both are required for the student to actually be usable end-to-end.
-    """
-    await asyncio.to_thread(sheets.add_roster_student, name, tg, group)
     try:
-        await asyncio.to_thread(sheets.add_finance_student, group, name, tg, amount, "Pending")
-    except Exception as exc:
-        log.warning("add_finance_student failed for %s in %s: %s", name, group, exc)
-        return (
-            f"Added {name} to Roster and {group}'s attendance tab, but couldn't create their "
-            f"Finance row automatically ({exc}) — add them to the Finance sheet's \"{group}\" tab "
-            f"manually with amount {amount}."
-        )
-    return f"Added {name}" + (f" (@{tg})" if tg else " (no TG handle yet)") + f" to {group}, tuition ${amount} (Pending)."
+        await asyncio.to_thread(sheets.remove_admin_panel_penalty, int(row_str))
+        msg = "✅ Penalty removed."
+    except Exception as e:
+        msg = f"⚠️ Error removing penalty: {str(e)}"
+
+    buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_setpayment_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Resolves which student was meant when a name/username search under
-    the payment-status flow returned more than one match."""
     query = update.callback_query
     await query.answer()
     if not is_admin_update(update):
@@ -647,175 +542,65 @@ async def admin_setpayment_pick_callback(update: Update, context: ContextTypes.D
 
     pending = context.user_data.get("pending_admin_action")
     if not pending or pending.get("type") != "setpayment":
-        await safe_edit_text(query, "That selection expired — start over with /admin.")
+        await query.edit_message_text("That selection expired — start over with /admin.")
         return
 
     _, _, student_name = query.data.partition(":")
     profile = await asyncio.to_thread(sheets.get_student_profile, student_name)
     if not profile or not profile.get("tg"):
-        await safe_edit_text(query, f"{student_name} has no TG handle on file — can't set payment status.")
+        await query.edit_message_text(f"{student_name} has no TG handle on file — can't set payment status.")
         context.user_data.pop("pending_admin_action", None)
         return
 
     target_username = profile["tg"].lstrip("@")
-    status = pending["status"]
+    success, msg = await set_payment_status(context.bot, target_username, pending["status"], source="admin_override")
 
-    if status.lower() == "pending":
-        context.user_data["pending_admin_action"] = {
-            "type": "setpayment_amount", "status": status,
-            "target_username": target_username, "student_name": student_name,
-        }
-        await safe_edit_text(query, f"How much {student_name} to pay?",
-                              reply_markup=_amount_picker_keyboard("setpayment"))
-        return
-
-    success, msg = await set_payment_status(context.bot, target_username, status, source="admin_override")
-    await safe_edit_text(query, msg if success else f"⚠️ {msg}")
+    result_msg = (f"✅ {msg}" if success else f"⚠️ {msg}")
+    buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
+    await query.edit_message_text(result_msg, reply_markup=InlineKeyboardMarkup(buttons))
     context.user_data.pop("pending_admin_action", None)
 
 
 async def admin_setpayment_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """After a status button is tapped: if the student is already known
-    (origin='direct', from a profile card), act immediately — no re-asking
-    for a username. If not (origin='search', from the top-level menu), ask
-    for a name/username to look up. Either way, choosing Pending branches
-    into the amount picker before finalizing.
-    """
     query = update.callback_query
     await query.answer()
+
     if not is_admin_update(update):
         return
 
-    parts = query.data.split(":")
-    status = parts[1] if len(parts) > 1 else ""
-    origin = parts[2] if len(parts) > 2 else "search"
-
-    if origin == "direct":
-        student_name = context.user_data.get("selected_student")
-        if not student_name:
-            await safe_edit_text(query, "No student selected — start over with /admin.")
-            return
-        profile = await asyncio.to_thread(sheets.get_student_profile, student_name)
-        if not profile or not profile.get("tg"):
-            await safe_edit_text(query, f"{student_name} has no TG handle on file — can't set payment status.")
-            return
-        target_username = profile["tg"].lstrip("@")
-
-        if status.lower() == "pending":
-            context.user_data["pending_admin_action"] = {
-                "type": "setpayment_amount", "status": status,
-                "target_username": target_username, "student_name": student_name,
-            }
-            await safe_edit_text(query, f"How much has {student_name} paid so far?",
-                                  reply_markup=_amount_picker_keyboard("setpayment"))
-            return
-
-        success, msg = await set_payment_status(context.bot, target_username, status, source="admin_override")
-        await safe_edit_text(query, msg if success else f"⚠️ {msg}")
-        return
-
-    # origin == "search" — student not yet known, ask for name/username
-    context.user_data["pending_admin_action"] = {"type": "setpayment", "status": status}
-    await safe_edit_text(query,
-        f"Setting status to *{status}*.\n\n"
+    _, _, status_label = query.data.partition(":")
+    context.user_data["pending_admin_action"] = {"type": "setpayment", "status": status_label}
+    await query.edit_message_text(
+        f"Setting status to *{status_label}*.\n\n"
         f"Now send the student's name or @username (partial is fine — I'll match it).",
         parse_mode="Markdown",
     )
 
 
-async def admin_amount_preset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the $89/$119/Custom buttons shown for both the Pending-amount
-    flow and the new-student tuition flow."""
-    query = update.callback_query
-    await query.answer()
-    if not is_admin_update(update):
-        return
-
-    _, purpose, code = query.data.split(":")
-    pending = context.user_data.get("pending_admin_action")
-    if not pending:
-        await safe_edit_text(query, "That selection expired — start over with /admin.")
-        return
-
-    if code == "custom":
-        pending["awaiting_custom_amount"] = True
-        context.user_data["pending_admin_action"] = pending
-        await safe_edit_text(query, "Send the amount as a number (e.g. \"50\").")
-        return
-
-    amount = PRESET_AMOUNTS[code]
-
-    if purpose == "setpayment":
-        success, msg = await set_payment_status(
-            context.bot, pending["target_username"], pending["status"], source="admin_override", amount=amount
-        )
-        await safe_edit_text(query, msg if success else f"⚠️ {msg}")
-    elif purpose == "addstudent":
-        result_msg = await _finalize_addstudent(pending["name"], pending["tg"], pending["group"], amount)
-        await safe_edit_text(query, result_msg)
-
-    context.user_data.pop("pending_admin_action", None)
-
-
 async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Catches the admin's plain-text reply after a guided-menu step that's
-    waiting on typed input. Does nothing if there's no pending action, so it
-    never interferes with normal admin chatting."""
     if not is_admin_update(update):
         return
 
     pending = context.user_data.get("pending_admin_action")
     if not pending:
-        return  # no guided flow in progress — ignore, let other handlers run
+        return
 
     text = update.message.text.strip()
-
-    if pending.get("awaiting_custom_amount"):
-        try:
-            amount = int(float(text.replace("$", "").strip()))
-        except ValueError:
-            await update.message.reply_text("Couldn't parse that as a number — send just the amount, e.g. \"50\".")
-            return  # keep pending so they can retry
-
-        if pending["type"] == "setpayment_amount":
-            success, msg = await set_payment_status(
-                context.bot, pending["target_username"], pending["status"], source="admin_override", amount=amount
-            )
-            await update.message.reply_text(msg if success else f"⚠️ {msg}")
-        elif pending["type"] == "addstudent_amount":
-            result_msg = await _finalize_addstudent(pending["name"], pending["tg"], pending["group"], amount)
-            await update.message.reply_text(result_msg)
-
-        context.user_data.pop("pending_admin_action", None)
-        return
 
     if pending["type"] == "setpayment":
         matches = await asyncio.to_thread(sheets.search_roster, text)
         if not matches:
             await update.message.reply_text(f"No student found matching '{text}'. Try again or /admin to restart.")
-            return  # keep pending so they can retry
+            return
         if len(matches) == 1:
             target_username = matches[0]["tg"].lstrip("@")
             if not target_username:
                 await update.message.reply_text(f"{matches[0]['name']} has no TG handle on file — can't set payment status.")
                 context.user_data.pop("pending_admin_action", None)
                 return
-            status = pending["status"]
-            if status.lower() == "pending":
-                context.user_data["pending_admin_action"] = {
-                    "type": "setpayment_amount", "status": status,
-                    "target_username": target_username, "student_name": matches[0]["name"],
-                }
-                await update.message.reply_text(
-                    f"How much has {matches[0]['name']} paid so far?",
-                    reply_markup=_amount_picker_keyboard("setpayment"),
-                )
-                return  # amount picker will finalize + clear pending
-            success, msg = await set_payment_status(context.bot, target_username, status, source="admin_override")
-            await update.message.reply_text(msg if success else f"⚠️ {msg}")
+            success, msg = await set_payment_status(context.bot, target_username, pending["status"], source="admin_override")
+            await update.message.reply_text((f"✅ {msg}" if success else f"⚠️ {msg}"))
         else:
-            # Multiple matches — keep the pending status alive and let the
-            # admin tap the right one instead of typing a more specific query.
             buttons = [
                 [InlineKeyboardButton(f"{m['name']} ({m['group']})", callback_data=f"admin_setpayment_pick:{m['name']}")]
                 for m in matches
@@ -823,8 +608,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"Found {len(matches)} matches — which one?", reply_markup=InlineKeyboardMarkup(buttons)
             )
-            return  # keep pending_admin_action set; the pick callback will clear it
-
+            return
     elif pending["type"] == "search_student":
         matches = await asyncio.to_thread(sheets.search_roster, text)
         if not matches:
@@ -841,81 +625,29 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = text.split(maxsplit=1)
         if len(parts) != 2 or not parts[0].lstrip("-").isdigit():
             await update.message.reply_text("Couldn't parse that — send it as: `<points> <reason text>`", parse_mode="Markdown")
-            return  # keep pending_admin_action set so they can retry
+            return
         points, reason = int(parts[0]), parts[1]
         profile = await asyncio.to_thread(sheets.get_student_profile, student_name)
         group = profile["group"] if profile else ""
-        await asyncio.to_thread(sheets.add_manual_penalty, student_name, group, reason, points, "Admin")
-        await update.message.reply_text(f"Added: {reason} ({points:+d}) for {student_name}.")
-
-    elif pending["type"] == "addstudent_name":
-        context.user_data["pending_admin_action"] = {"type": "addstudent_tg", "name": text}
-        await update.message.reply_text(
-            f"Name: {text}\n\nNow send their @username (or type \"none\" if they don't have one yet)."
-        )
-        return  # keep the flow going — don't clear pending_admin_action
-
-    elif pending["type"] == "addstudent_tg":
-        tg = "" if text.lower() == "none" else text.lstrip("@")
-        groups = await asyncio.to_thread(sheets.get_groups_schedule)
-        if not groups:
-            await update.message.reply_text("No groups exist yet — add a group first.")
-            return
-        buttons = [
-            [InlineKeyboardButton(g["name"], callback_data=f"admin_addstudent_group:{g['name']}")]
-            for g in groups
-        ]
-        context.user_data["pending_admin_action"] = {"type": "addstudent_pick_group", "name": pending["name"], "tg": tg}
-        await update.message.reply_text("Which group?", reply_markup=InlineKeyboardMarkup(buttons))
-        return  # next step (tuition amount) is triggered by the group-pick callback
-
-    elif pending["type"] == "addgroup_name":
-        context.user_data["pending_admin_action"] = {"type": "addgroup_days", "name": text}
-        await update.message.reply_text(
-            f"Group name: {text}\n\nNow send the days it meets, comma-separated "
-            f"(use Mon/Tue/Wed/Thu/Fri/Sat/Sun) — e.g. \"Mon,Wed,Fri\"."
-        )
-        return
-
-    elif pending["type"] == "addgroup_days":
-        context.user_data["pending_admin_action"] = {"type": "addgroup_start", "name": pending["name"], "days": text}
-        await update.message.reply_text("Now send the start time (24h HH:MM, e.g. \"16:00\").")
-        return
-
-    elif pending["type"] == "addgroup_start":
-        context.user_data["pending_admin_action"] = {
-            "type": "addgroup_end", "name": pending["name"], "days": pending["days"], "start": text
-        }
-        await update.message.reply_text("Now send the end time (24h HH:MM, e.g. \"18:00\").")
-        return
-
-    elif pending["type"] == "addgroup_end":
-        await asyncio.to_thread(sheets.add_group, pending["name"], pending["days"], pending["start"], text)
-        await update.message.reply_text(
-            f"Group \"{pending['name']}\" created ({pending['days']}, {pending['start']}–{text}). "
-            f"Its attendance tab is ready — add students to it with ➕ Add student."
-        )
+        try:
+            await asyncio.to_thread(sheets.add_manual_penalty, student_name, group, reason, points, "Admin")
+            await update.message.reply_text(f"✅ Added: {reason} ({points:+d}) for {student_name}.")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Error adding penalty: {str(e)}")
 
     context.user_data.pop("pending_admin_action", None)
 
 
 async def admin_setpayment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/admin_setpayment <name or @username> <paid|pending|scholarship|cancelled>
-    — manual override, admin-only. Routes through the same set_payment_status()
-    the buttons use, so there is only ever one code path that writes to
-    the Finance sheet.
-    """
     if not is_admin_update(update):
-        return  # silently ignore non-admins
-
-    valid = {s.lower() for s in PAYMENT_STATUSES}
-    if len(context.args) < 2 or context.args[-1].lower() not in valid:
-        await update.message.reply_text(
-            f"Usage: /admin_setpayment <name or @username> <{'|'.join(s.lower() for s in PAYMENT_STATUSES)}>"
-        )
         return
 
-    new_status = next(s for s in PAYMENT_STATUSES if s.lower() == context.args[-1].lower())
+    valid_statuses = {"paid": "Paid", "scholarship": "Scholarship", "pending": "Pending", "cancel": "Cancel"}
+    if len(context.args) < 2 or context.args[-1].lower() not in valid_statuses:
+        await update.message.reply_text("Usage: /admin_setpayment <name or @username> <paid|scholarship|pending|cancel>")
+        return
+
+    status_label = valid_statuses[context.args[-1].lower()]
     query_text = " ".join(context.args[:-1])
 
     matches = await asyncio.to_thread(sheets.search_roster, query_text)
@@ -927,7 +659,7 @@ async def admin_setpayment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"{m['name']} ({m['group']})", callback_data=f"admin_setpayment_pick:{m['name']}")]
             for m in matches
         ]
-        context.user_data["pending_admin_action"] = {"type": "setpayment", "status": new_status}
+        context.user_data["pending_admin_action"] = {"type": "setpayment", "status": status_label}
         await update.message.reply_text(f"Found {len(matches)} matches — which one?",
                                          reply_markup=InlineKeyboardMarkup(buttons))
         return
@@ -937,18 +669,7 @@ async def admin_setpayment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{matches[0]['name']} has no TG handle on file — can't set payment status.")
         return
 
-    if new_status.lower() == "pending":
-        context.user_data["pending_admin_action"] = {
-            "type": "setpayment_amount", "status": new_status,
-            "target_username": target_username, "student_name": matches[0]["name"],
-        }
-        await update.message.reply_text(
-            f"How much has {matches[0]['name']} paid so far?",
-            reply_markup=_amount_picker_keyboard("setpayment"),
-        )
-        return
-
-    success, msg = await set_payment_status(context.bot, target_username, new_status, source="admin_override")
+    success, msg = await set_payment_status(context.bot, target_username, status_label, source="admin_override")
     await update.message.reply_text(msg if success else f"⚠️ {msg}")
 
 
@@ -962,19 +683,38 @@ async def proof_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, _, target_username = query.data.partition(":")
     bd_entry = await asyncio.to_thread(sheets.find_bot_data_row, target_username)
 
+    base_caption = query.message.caption or ""
+
     if not bd_entry or not bd_entry.get("chat_id"):
-        await safe_edit_caption(query, caption=query.message.caption + "\n\n⚠️ No linked chat found.")
+        await query.edit_message_caption(caption=base_caption + "\n\n⚠️ No linked chat found.")
         return
 
     if action == "reject":
         await asyncio.to_thread(sheets.clear_payment_proof, target_username)
         await notify_student(context.bot, int(bd_entry["chat_id"]), text=messages.proof_rejected())
-        await safe_edit_caption(query, caption=query.message.caption + "\n\n❌ Rejected")
+        await query.edit_message_caption(caption=base_caption + "\n\n❌ Rejected")
 
     elif action == "approve":
-        success, _ = await set_payment_status(context.bot, target_username, "Paid", source="proof")
+        success, _ = await approve_payment(context.bot, target_username, source="proof")
         suffix = "\n\n✅ Approved" if success else "\n\n⚠️ Approval failed — check logs."
-        await safe_edit_caption(query, caption=query.message.caption + suffix)
+        await query.edit_message_caption(caption=base_caption + suffix)
+
+
+async def approve_payment(bot, target_username: str, source: str) -> tuple[bool, str]:
+    return await set_payment_status(bot, target_username, "Paid", source=source)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled exception while processing update: %s", update, exc_info=context.error)
+    if config.ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=config.ADMIN_CHAT_ID,
+                text=f"⚠️ Bot error: {type(context.error).__name__}: {context.error}",
+            )
+        except Exception:
+            pass
+
 
 async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
@@ -997,11 +737,12 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(config.PAYME_QR_FILE, "rb") as photo:
         await update.message.reply_photo(photo=photo, caption=caption)
     await asyncio.to_thread(sheets.mark_pay_shown, username)
-    
+
 
 # --- Scheduler lifecycle ---------------------------------------------------
 async def on_startup(app: Application):
     await set_bot_commands(app)
+    log.info("DEBUG: ADMIN_CHAT_ID=%r ADMIN_USER_IDS=%r", config.ADMIN_CHAT_ID, config.ADMIN_USER_IDS)
 
     scheduler = AsyncIOScheduler()
     if config.REMINDER_INTERVAL_MINUTES > 0:
@@ -1044,9 +785,10 @@ async def on_startup(app: Application):
         config.PAYMENT_CHECK_MINUTE,
     )
 
+
 async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_update(update):
-        return  # silently ignore non-admins
+        return
 
     if not context.args:
         await update.message.reply_text("Usage: /reject <username>")
@@ -1065,11 +807,253 @@ async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await notify_student(context.bot, int(bd_entry["chat_id"]), text=messages.proof_rejected())
     await update.message.reply_text(f"Rejected proof for @{target_username}, they've been notified.")
 
+
 async def on_shutdown(app: Application):
     scheduler = app.bot_data.get("scheduler")
     if scheduler:
         scheduler.shutdown(wait=False)
         log.info("Scheduler stopped")
+
+
+# --- Attendance Marking (Teacher UI) ----------------------------------------
+
+_STATUS_EMOJI = {"Present": "✅", "Late": "⏰", "Excused": "✋", "Absent": "❌"}
+_STATUS_ORDER = ["Present", "Late", "Excused", "Absent"]
+
+
+async def attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_update(update):
+        return
+    await _show_attendance_group_picker(update.message.reply_text)
+
+
+async def _show_attendance_group_picker(send):
+    groups = await asyncio.to_thread(sheets.get_groups_schedule)
+    buttons = [[InlineKeyboardButton(g["name"], callback_data=f"attendance_group:{g['name']}")] for g in groups]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="attendance:cancel")])
+    await send("👥 Mark attendance — pick a group:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def attendance_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+
+    context.user_data.pop("attendance_group", None)
+    context.user_data.pop("attendance_date", None)
+    context.user_data.pop("attendance_students", None)
+    context.user_data.pop("attendance_marks", None)
+
+    await query.edit_message_text("Cancelled.")
+
+
+async def attendance_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+
+    _, _, group_name = query.data.partition(":")
+    context.user_data["attendance_group"] = group_name
+
+    import datetime
+    today = datetime.date.today()
+
+    last_session = await asyncio.to_thread(sheets.get_last_session_date, group_name)
+
+    buttons = []
+    if last_session:
+        label_date = datetime.datetime.strptime(last_session, "%Y-%m-%d").date()
+        buttons.append([InlineKeyboardButton(
+            f"🕐 Last session ({label_date.strftime('%a %b %d')})",
+            callback_data=f"attendance_date:{last_session}"
+        )])
+
+    for offset in range(4):
+        date = today + datetime.timedelta(days=offset)
+        date_str = date.isoformat()
+        label = "Today" if offset == 0 else date.strftime("%a %b %d")
+        buttons.append([InlineKeyboardButton(label, callback_data=f"attendance_date:{date_str}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="attendance:back_to_groups")])
+
+    await query.edit_message_text(
+        f"👥 {group_name}\n\n📅 Pick a date:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def attendance_back_to_groups_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+    context.user_data.pop("attendance_group", None)
+    await _show_attendance_group_picker(query.edit_message_text)
+
+
+def _build_attendance_keyboard(students: list, marks: dict) -> list:
+    buttons = []
+    for idx, student in enumerate(students):
+        buttons.append([InlineKeyboardButton(f"👤 {student['name']}", callback_data="noop")])
+
+        status = marks.get(idx)
+        if status:
+            emoji = _STATUS_EMOJI.get(status, "❓")
+            buttons.append([
+                InlineKeyboardButton(f"{emoji} {status}", callback_data="noop"),
+                InlineKeyboardButton("↩️ Change", callback_data=f"attendance_change:{idx}"),
+            ])
+        else:
+            row = []
+            for s in _STATUS_ORDER:
+                row.append(InlineKeyboardButton(f"{_STATUS_EMOJI[s]} {s}", callback_data=f"attendance_mark:{idx}:{s}"))
+            buttons.append(row)
+
+    marked_count = len(marks)
+    buttons.append([InlineKeyboardButton(f"✅ Submit ({marked_count}/{len(students)})", callback_data="attendance_submit")])
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="attendance:back_to_groups")])
+    return buttons
+
+
+async def attendance_date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+
+    _, _, date_str = query.data.partition(":")
+    context.user_data["attendance_date"] = date_str
+    group_name = context.user_data.get("attendance_group")
+
+    students = await asyncio.to_thread(sheets.get_students_for_group, group_name)
+    if not students:
+        await query.edit_message_text(f"No students found in {group_name}.")
+        return
+
+    current_attendance = await asyncio.to_thread(sheets.get_attendance_for_date_group, date_str, group_name)
+
+    context.user_data["attendance_students"] = students
+    marks = {}
+    for idx, student in enumerate(students):
+        existing = current_attendance.get(student["name"], "")
+        if existing in _STATUS_EMOJI:
+            marks[idx] = existing
+    context.user_data["attendance_marks"] = marks
+
+    await query.edit_message_text(
+        f"👥 {group_name} | 📅 {date_str}\n\nTap a status for each student:",
+        reply_markup=InlineKeyboardMarkup(_build_attendance_keyboard(students, marks))
+    )
+
+
+async def attendance_mark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin_update(update):
+        await query.answer()
+        return
+
+    _, idx_str, status = query.data.split(":", 2)
+    idx = int(idx_str)
+
+    students = context.user_data.get("attendance_students")
+    marks = context.user_data.get("attendance_marks")
+    if students is None or marks is None:
+        await query.answer("⚠️ Session lost — start over with /attendance", show_alert=True)
+        return
+
+    marks[idx] = status
+    emoji = _STATUS_EMOJI.get(status, "❓")
+    student_name = students[idx]["name"] if idx < len(students) else "Student"
+    await query.answer(f"{emoji} {student_name} marked {status}")
+
+    group_name = context.user_data.get("attendance_group")
+    date_str = context.user_data.get("attendance_date")
+    await query.edit_message_text(
+        f"👥 {group_name} | 📅 {date_str}\n\nTap a status for each student:",
+        reply_markup=InlineKeyboardMarkup(_build_attendance_keyboard(students, marks))
+    )
+
+
+async def attendance_change_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin_update(update):
+        await query.answer()
+        return
+
+    _, _, idx_str = query.data.partition(":")
+    idx = int(idx_str)
+
+    students = context.user_data.get("attendance_students")
+    marks = context.user_data.get("attendance_marks")
+    if students is None or marks is None:
+        await query.answer("⚠️ Session lost — start over with /attendance", show_alert=True)
+        return
+
+    marks.pop(idx, None)
+    await query.answer()
+
+    group_name = context.user_data.get("attendance_group")
+    date_str = context.user_data.get("attendance_date")
+    await query.edit_message_text(
+        f"👥 {group_name} | 📅 {date_str}\n\nTap a status for each student:",
+        reply_markup=InlineKeyboardMarkup(_build_attendance_keyboard(students, marks))
+    )
+
+
+async def attendance_submit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+
+    students = context.user_data.get("attendance_students")
+    marks = context.user_data.get("attendance_marks")
+    group_name = context.user_data.get("attendance_group")
+    date_str = context.user_data.get("attendance_date")
+
+    if not students or not marks:
+        await query.answer("No attendance marked", show_alert=True)
+        return
+
+    failed = []
+    for idx, status in marks.items():
+        student_name = students[idx]["name"]
+        success = await asyncio.to_thread(
+            sheets.mark_attendance, date_str, group_name, student_name, status
+        )
+        if not success:
+            failed.append(student_name)
+        else:
+            log.info(f"Attendance submitted: {student_name} ({group_name}) on {date_str} → {status}")
+
+    summary = {s: sum(1 for v in marks.values() if v == s) for s in _STATUS_ORDER}
+    unmarked = len(students) - len(marks)
+
+    report_lines = [f"✅ Submitted {len(marks) - len(failed)} of {len(students)} student(s)\n"]
+    report_lines.append("📊 Summary:")
+    for s in _STATUS_ORDER:
+        report_lines.append(f"  {_STATUS_EMOJI[s]} {s}: {summary[s]}")
+    if unmarked:
+        report_lines.append(f"  ⬜ Not marked: {unmarked}")
+    if failed:
+        report_lines.append(f"\n⚠️ Failed to save: {', '.join(failed)}")
+
+    buttons = [
+        [InlineKeyboardButton("📅 Mark another date/group", callback_data="attendance:back_to_groups")],
+    ]
+    await query.edit_message_text("\n".join(report_lines), reply_markup=InlineKeyboardMarkup(buttons))
+
+    context.user_data.pop("attendance_group", None)
+    context.user_data.pop("attendance_date", None)
+    context.user_data.pop("attendance_students", None)
+    context.user_data.pop("attendance_marks", None)
+
+
+async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
 
 def main():
@@ -1094,31 +1078,31 @@ def main():
     app.add_handler(CommandHandler("reject", reject))
     app.add_handler(CommandHandler("admin_setpayment", admin_setpayment))
     app.add_handler(CommandHandler("admin", admin_menu))
+    app.add_handler(CommandHandler("attendance", attendance))
     app.add_handler(MessageHandler(filters.PHOTO, photo))
     app.add_handler(CommandHandler("pay", pay))
 
-    # Order matters: more specific callback_data patterns first, proof_decision
-    # (no pattern — catches "approve:"/"reject:") stays last as the fallback.
+    app.add_handler(CallbackQueryHandler(attendance_group_callback, pattern=r"^attendance_group:"))
+    app.add_handler(CallbackQueryHandler(attendance_date_callback, pattern=r"^attendance_date:"))
+    app.add_handler(CallbackQueryHandler(attendance_mark_callback, pattern=r"^attendance_mark:"))
+    app.add_handler(CallbackQueryHandler(attendance_change_callback, pattern=r"^attendance_change:"))
+    app.add_handler(CallbackQueryHandler(attendance_submit_callback, pattern=r"^attendance_submit$"))
+    app.add_handler(CallbackQueryHandler(attendance_back_to_groups_callback, pattern=r"^attendance:back_to_groups$"))
+    app.add_handler(CallbackQueryHandler(attendance_cancel_callback, pattern=r"^attendance:cancel$"))
+    app.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
+    app.add_error_handler(error_handler)
     app.add_handler(CallbackQueryHandler(admin_menu_callback, pattern=r"^admin_menu:"))
     app.add_handler(CallbackQueryHandler(admin_group_callback, pattern=r"^admin_group:"))
     app.add_handler(CallbackQueryHandler(admin_pick_student_callback, pattern=r"^admin_pick:"))
     app.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admin_action:"))
+    app.add_handler(CallbackQueryHandler(admin_sendreminder_callback, pattern=r"^admin_sendreminder:"))
     app.add_handler(CallbackQueryHandler(admin_penalty_preset_callback, pattern=r"^admin_penalty_preset:"))
     app.add_handler(CallbackQueryHandler(admin_removepenalty_row_callback, pattern=r"^admin_removepenalty_row:"))
     app.add_handler(CallbackQueryHandler(admin_setpayment_status_callback, pattern=r"^admin_setpayment_status:"))
     app.add_handler(CallbackQueryHandler(admin_setpayment_pick_callback, pattern=r"^admin_setpayment_pick:"))
-    app.add_handler(CallbackQueryHandler(admin_amount_preset_callback, pattern=r"^admin_amount_preset:"))
-    app.add_handler(CallbackQueryHandler(admin_addstudent_group_callback, pattern=r"^admin_addstudent_group:"))
-    app.add_handler(CallbackQueryHandler(admin_removestudent_confirm_callback, pattern=r"^admin_removestudent_confirm:"))
-    app.add_handler(CallbackQueryHandler(admin_removegroup_pick_callback, pattern=r"^admin_removegroup_pick:"))
-    app.add_handler(CallbackQueryHandler(admin_removegroup_confirm_callback, pattern=r"^admin_removegroup_confirm:"))
-    app.add_handler(CallbackQueryHandler(proof_decision))
+    app.add_handler(CallbackQueryHandler(proof_decision, pattern=r"^(approve|reject):"))
+    app.add_handler(CallbackQueryHandler(admin_setpayment_execute_callback, pattern=r"^admin_setpayment_execute:"))
 
-    # Plain-text replies during a guided admin flow (search query, custom
-    # penalty, username for payment) — must not swallow normal messages, so
-    # it only acts when a pending_admin_action is actually set (checked
-    # inside admin_text_input itself). Registered after admin-only command
-    # handlers so /commands still route correctly first.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_input))
 
     log.info("Bot starting (polling)...")
