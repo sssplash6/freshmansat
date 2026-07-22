@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 # --- Paths -----------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
-
+ADMIN_USER_IDS = [int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()]
 
 
 # --- Credentials: written to the persistent disk from an env var at startup,

@@ -37,6 +37,18 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
+def is_admin_update(update: Update) -> bool:
+    """True if this update is from the admin group OR from a whitelisted
+    admin user's private DM. Use this instead of comparing chat_id directly,
+    so admins can use the bot outside the group too."""
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    user_id = update.effective_user.id if update.effective_user else None
+    if chat_id is not None and str(chat_id) == str(config.ADMIN_CHAT_ID):
+        return True
+    if user_id is not None and user_id in config.ADMIN_USER_IDS:
+        return True
+    return False
+
 
 async def safe_edit_text(query, text, **kwargs):
     """Wraps query.edit_message_text, swallowing Telegram's harmless
@@ -245,7 +257,7 @@ async def set_bot_commands(app: Application):
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/admin — entry point to a button-driven menu, so the admin never has
     to remember exact command syntax."""
-    if str(update.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     keyboard = InlineKeyboardMarkup([
@@ -280,7 +292,7 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
 
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     _, _, action = query.data.partition(":")
@@ -339,7 +351,7 @@ async def admin_removegroup_pick_callback(update: Update, context: ContextTypes.
     """Confirmation step before actually deleting a Groups row."""
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
     _, _, group_name = query.data.partition(":")
     keyboard = InlineKeyboardMarkup([
@@ -353,7 +365,7 @@ async def admin_removegroup_pick_callback(update: Update, context: ContextTypes.
 async def admin_removegroup_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
     _, _, group_name = query.data.partition(":")
     removed = await asyncio.to_thread(sheets.remove_group, group_name)
@@ -366,7 +378,7 @@ async def admin_group_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     """After picking a group from Browse Roster, show its students as buttons."""
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     _, _, group_name = query.data.partition(":")
@@ -384,7 +396,7 @@ async def admin_pick_student_callback(update: Update, context: ContextTypes.DEFA
     """A student was picked (from browse or search) — show their action card."""
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     _, _, student_name = query.data.partition(":")
@@ -434,7 +446,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     """Handles the per-student action card buttons (profile/add/remove/payment)."""
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     student_name = context.user_data.get("selected_student")
@@ -519,7 +531,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def admin_removestudent_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
     _, _, row_str = query.data.partition(":")
     await asyncio.to_thread(sheets.set_student_status, int(row_str), "inactive")
@@ -530,7 +542,7 @@ async def admin_penalty_preset_callback(update: Update, context: ContextTypes.DE
     """Handles the preset-reason buttons under Add Penalty."""
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     student_name = context.user_data.get("selected_student")
@@ -560,7 +572,7 @@ async def admin_removepenalty_row_callback(update: Update, context: ContextTypes
     """Handles tapping a specific penalty to remove."""
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     _, _, row_str = query.data.partition(":")
@@ -574,7 +586,7 @@ async def admin_addstudent_group_callback(update: Update, context: ContextTypes.
     Finance row (with an amount) to be usable end-to-end."""
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     pending = context.user_data.get("pending_admin_action")
@@ -630,7 +642,7 @@ async def admin_setpayment_pick_callback(update: Update, context: ContextTypes.D
     the payment-status flow returned more than one match."""
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     pending = context.user_data.get("pending_admin_action")
@@ -671,7 +683,7 @@ async def admin_setpayment_status_callback(update: Update, context: ContextTypes
     """
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     parts = query.data.split(":")
@@ -716,7 +728,7 @@ async def admin_amount_preset_callback(update: Update, context: ContextTypes.DEF
     flow and the new-student tuition flow."""
     query = update.callback_query
     await query.answer()
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     _, purpose, code = query.data.split(":")
@@ -749,7 +761,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Catches the admin's plain-text reply after a guided-menu step that's
     waiting on typed input. Does nothing if there's no pending action, so it
     never interferes with normal admin chatting."""
-    if str(update.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     pending = context.user_data.get("pending_admin_action")
@@ -893,7 +905,7 @@ async def admin_setpayment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     the buttons use, so there is only ever one code path that writes to
     the Finance sheet.
     """
-    if str(update.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return  # silently ignore non-admins
 
     valid = {s.lower() for s in PAYMENT_STATUSES}
@@ -944,7 +956,7 @@ async def proof_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if str(query.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return
 
     action, _, target_username = query.data.partition(":")
@@ -1033,7 +1045,7 @@ async def on_startup(app: Application):
     )
 
 async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.message.chat_id) != str(config.ADMIN_CHAT_ID):
+    if not is_admin_update(update):
         return  # silently ignore non-admins
 
     if not context.args:

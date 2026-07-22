@@ -225,6 +225,27 @@ async def run_reminders(bot):
 def _is_paid(status: str) -> bool:
     return status.strip().lower() in config.PAID_STATUSES
 
+async def send_manual_reminder(bot, username: str) -> tuple[bool, str]:
+    """Sends one reminder on-demand for a single student — same path
+    run_reminders uses, just triggered by an admin tap instead of the timer."""
+    rec = await asyncio.to_thread(sheets.find_student, username)
+    if not rec:
+        return False, f"No student record found for @{username}."
+    bd_entry = await asyncio.to_thread(sheets.find_bot_data_row, username)
+    if not bd_entry or not str(bd_entry.get("chat_id", "")).strip():
+        return False, f"@{username} hasn't linked their chat yet (no /start)."
+
+    reminder_number = await asyncio.to_thread(sheets.count_sent, username) + 1
+    caption = messages.reminder_text(rec["name"], rec["amount"], reminder_number)
+    try:
+        with open(config.PAYME_QR_FILE, "rb") as photo:
+            await notify_student(bot, int(bd_entry["chat_id"]), photo=photo, caption=caption)
+    except Exception as exc:
+        return False, f"Failed to send: {exc}"
+
+    await asyncio.to_thread(sheets.append_send_log, rec["group"], rec["name"], username, "sent", reminder_number)
+    await asyncio.to_thread(sheets.mark_pay_shown, username)
+    return True, f"Reminder sent to {rec['name']}."
 
 def _skip_reminder(status: str) -> bool:
     return status.strip().lower() in config.NO_REMINDER_STATUSES

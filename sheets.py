@@ -712,6 +712,155 @@ def get_roster_by_group(group_name):
     appear in every group they're actually enrolled in."""
     return [row for row in get_roster_rows() if row["group"] == group_name]
 
+def get_students_for_group(group_name):
+    """Alias used by the attendance-marking flow."""
+    return get_roster_by_group(group_name)
+
+
+def _parse_session_date(raw: str):
+    """Parses a Session Date cell that may be a clean 'YYYY-MM-DD' string
+    (from Telegram-originated marks) or a messy JS Date.toString() (from the
+    original Apps Script wide-sheet sync, e.g. 'Sat Aug 15 2026 00:00:00
+    GMT+0500 ...'). Returns a datetime.date or None."""
+    raw = raw.strip()
+    try:
+        return datetime.date.fromisoformat(raw[:10])
+    except ValueError:
+        pass
+    months = {m: i + 1 for i, m in enumerate(
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])}
+    import re
+    m = re.search(r"(\w{3}) (\d{1,2}) (\d{4})", raw)
+    if m and m.group(1) in months:
+        return datetime.date(int(m.group(3)), months[m.group(1)], int(m.group(2)))
+    return None
+
+
+def get_last_session_date(group_name):
+    """Most recent Session Date logged for this group in Attendance_Log,
+    as 'YYYY-MM-DD', or None if there's no history yet."""
+    ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return None
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in ("Group", "Session Date")}
+    g_i, d_i = idx.get("Group"), idx.get("Session Date")
+    if g_i is None or d_i is None:
+        return None
+    best = None
+    for raw in values[1:]:
+        if g_i >= len(raw) or _norm(raw[g_i]) != group_name:
+            continue
+        d = _parse_session_date(_norm(raw[d_i])) if d_i < len(raw) else None
+        if d and (best is None or d > best):
+            best = d
+    return best.isoformat() if best else None
+
+
+def get_attendance_for_date_group(date_str, group_name):
+    """{student_name: status} already marked for this exact date+group."""
+    ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return {}
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Session Date", "Status")}
+    target_date = datetime.date.fromisoformat(date_str)
+    result = {}
+    for raw in values[1:]:
+        def get(col):
+            i = idx.get(col)
+            return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
+        if get("Group") != group_name:
+            continue
+        d = _parse_session_date(get("Session Date"))
+        if d == target_date:
+            result[get("Student")] = get("Status")
+    return result
+
+
+def _find_attendance_log_row(student_name, group_name, target_date):
+    ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return None, None
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Session Date", "Status")}
+    for r, raw in enumerate(values[1:], start=2):
+        def get(col):
+            i = idx.get(col)
+            return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
+        if get("Student") == student_name and get("Group") == group_name:
+            if _parse_session_date(get("Session Date")) == target_date:
+                return r, get("Status")
+    return None, None
+
+
+def _remove_penalty_by_reason(student_name, reason):
+    ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return
+    headers = values[0]
+    idx = {c: _header_index(headers, c) for c in ("Student", "Reason", "Status")}
+    s_i, r_i, st_i = idx.get("Student"), idx.get("Reason"), idx.get("Status")
+    status_col = idx.get("Status")
+    for r, raw in enumerate(values[1:], start=2):
+        if (s_i is not None and s_i < len(raw) and _norm(raw[s_i]) == student_name
+                and r_i is not None and r_i < len(raw) and _norm(raw[r_i]) == reason
+                and st_i is not None and st_i < len(raw) and _norm(raw[st_i]) == "Active"):
+            ws.update_cell(r, status_col + 1, "Removed")
+
+
+def mark_attendance(date_str, group_name, student_name, status):
+    """Writes/updates one attendance mark and keeps Penalty_Log in sync —
+    reverses the old status's penalty (if any) before applying the new
+    one, so using the Change button to correct a mistake doesn't leave
+    stale or duplicate penalties behind."""
+    target_date = datetime.date.fromisoformat(date_str)
+    row_number, old_status = _find_attendance_log_row(student_name, group_name, target_date)
+
+    if old_status == status:
+        return True  # no-op, already this status
+
+    if old_status == "Absent":
+        _remove_penalty_by_reason(student_name, f"Unexcused absence ({date_str})")
+    elif old_status == "Late":
+        _remove_penalty_by_reason(student_name, f"Lateness ({date_str})")
+
+    ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
+    if row_number:
+        headers = ws.row_values(1)
+        status_col = _header_index(headers, "Status")
+        marked_by_col = _header_index(headers, "Marked By")
+        if status_col is not None:
+            ws.update_cell(row_number, status_col + 1, status)
+        if marked_by_col is not None:
+            ws.update_cell(row_number, marked_by_col + 1, "Telegram Admin")
+    else:
+        ws.append_row([now_str(), student_name, group_name, date_str, status, "Telegram Admin"],
+                       value_input_option="USER_ENTERED")
+
+    if status == "Absent":
+        add_manual_penalty(student_name, group_name, f"Unexcused absence ({date_str})", 1, "System")
+    elif status == "Late":
+        # Count this student's total Late marks in this group to apply the
+        # every-3rd-lateness rule, same as the Apps Script sync logic.
+        ws2 = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
+        values = ws2.get_all_values()
+        headers = values[0]
+        idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Status")}
+        late_count = sum(
+            1 for raw in values[1:]
+            if idx.get("Student") is not None and idx["Student"] < len(raw) and _norm(raw[idx["Student"]]) == student_name
+            and idx.get("Group") is not None and idx["Group"] < len(raw) and _norm(raw[idx["Group"]]) == group_name
+            and idx.get("Status") is not None and idx["Status"] < len(raw) and _norm(raw[idx["Status"]]) == "Late"
+        )
+        if late_count % 3 == 0:
+            add_manual_penalty(student_name, group_name, f"Lateness ({date_str})", 1, "System")
+
+    return True
 
 def add_roster_student(name, tg_handle, group):
     """Adds a student to Roster for a given group (Status: active).
