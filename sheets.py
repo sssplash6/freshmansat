@@ -349,6 +349,16 @@ def set_finance_status(ws, row_number, status):
     if status.strip().lower() == "paid" and date_col is not None:
         ws.update_cell(row_number, date_col + 1, today_str())
 
+def set_finance_amount(ws, row_number, amount):
+    """Updates just the Amount column for a specific Finance row — used by
+    the 'Edit tuition' flow to correct/change an existing student's amount
+    owed without touching their Status."""
+    values = ws.get_all_values()
+    header_i = _detect_header_row(values, (config.COL_AMOUNT,))
+    headers = values[header_i]
+    amount_col = _header_index(headers, config.COL_AMOUNT)
+    if amount_col is not None:
+        ws.update_cell(row_number, amount_col + 1, amount)
 
 def add_finance_student(group_tab_name, name, tg_handle, amount, status="Pending"):
     """Adds a new student row directly to a Finance group tab — creating

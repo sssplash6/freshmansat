@@ -7,6 +7,7 @@ bot's async event loop.
 Run:  ./venv/bin/python bot.py
 """
 import asyncio
+import datetime
 import logging
 
 
@@ -213,6 +214,7 @@ async def set_bot_commands(app: Application):
         BotCommand("attendance", "Mark attendance"),
         BotCommand("admin_setpayment", "Set a student's payment status directly"),
         BotCommand("reject", "Reject a student's payment proof"),
+        BotCommand("admin_report", "Weekly/monthly stats per group"),
     ]
     admin_chat_ids = set()
     if config.ADMIN_CHAT_ID:
@@ -236,6 +238,9 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📋 Browse roster", callback_data="admin_menu:browse")],
         [InlineKeyboardButton("🔍 Search student", callback_data="admin_menu:search")],
         [InlineKeyboardButton("✅ Mark attendance", callback_data="admin_menu:attendance")],
+        [InlineKeyboardButton("➕ Add student", callback_data="admin_menu:addstudent")],
+        [InlineKeyboardButton("➕ Add group", callback_data="admin_menu:addgroup")],
+        [InlineKeyboardButton("🗑 Remove group", callback_data="admin_menu:removegroup")],
         [InlineKeyboardButton("❌ Cancel", callback_data="admin_menu:cancel")],
     ])
     await update.message.reply_text(
@@ -287,6 +292,33 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if action == "attendance":
         await _show_attendance_group_picker(query.edit_message_text)
         return
+    
+    if action == "addstudent":
+        context.user_data["pending_admin_action"] = {"type": "addstudent_name"}
+        await query.edit_message_text("New student — send their full name.")
+        return
+
+    if action == "addgroup":
+        context.user_data["pending_admin_action"] = {"type": "addgroup_name"}
+        await query.edit_message_text("New group — send the group name (e.g. \"Padawan Offline 2\").")
+        return
+
+    if action == "removegroup":
+        groups = await asyncio.to_thread(sheets.get_groups_schedule)
+        if not groups:
+            await query.edit_message_text("No groups found.")
+            return
+        buttons = [[InlineKeyboardButton(g["name"], callback_data=f"admin_removegroup_pick:{g['name']}")] for g in groups]
+        buttons.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
+        await query.edit_message_text(
+            "Pick a group to remove.\n\nThis only removes it from scheduling/syncing — "
+            "students, attendance history, and logs are kept untouched.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+
+
 
     if action.startswith("admin_setpayment_status"):
         return
@@ -323,6 +355,8 @@ async def admin_pick_student_callback(update: Update, context: ContextTypes.DEFA
         [InlineKeyboardButton("➕ Add penalty", callback_data="admin_action:addpenalty")],
         [InlineKeyboardButton("➖ Remove penalty", callback_data="admin_action:removepenalty")],
         [InlineKeyboardButton("💰 Set payment status", callback_data="admin_action:setpayment_direct")],
+        [InlineKeyboardButton("🚫 Remove student", callback_data="admin_action:removestudent")],
+        [InlineKeyboardButton("✏️ Edit tuition", callback_data="admin_action:edittuition")],
         [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
     ])
     await query.edit_message_text(f"*{_md(student_name)}* — what would you like to do?",
@@ -430,7 +464,146 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         ])
         await query.edit_message_text("Set status to:", reply_markup=keyboard)
         return
+    
+    if action == "removestudent":
+        rows = await asyncio.to_thread(sheets.get_roster_rows_for_student, student_name, False)
+        active_rows = [r for r in rows if r["status"].lower() == "active"]
+        if not active_rows:
+            await query.edit_message_text(f"{student_name} has no active roster entries to remove.")
+            return
+        if len(active_rows) == 1:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, remove", callback_data=f"admin_removestudent_confirm:{active_rows[0]['row_number']}")],
+                [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
+            ])
+            await query.edit_message_text(
+                f"Remove *{_md(student_name)}* from {active_rows[0]['group']}?\n\n"
+                f"This keeps all their history — it just marks them inactive.",
+                parse_mode="Markdown", reply_markup=keyboard,
+            )
+        else:
+            buttons = [
+                [InlineKeyboardButton(f"Remove from {r['group']}", callback_data=f"admin_removestudent_confirm:{r['row_number']}")]
+                for r in active_rows
+            ]
+            buttons.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
+            await query.edit_message_text(
+                f"*{_md(student_name)}* is enrolled in multiple groups — remove from which one?",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        return
 
+    if action == "edittuition":
+        context.user_data["pending_admin_action"] = {"type": "edittuition_amount", "student": student_name}
+        await query.edit_message_text(f"New tuition for *{_md(student_name)}*:", parse_mode="Markdown",
+                                       reply_markup=_tuition_amount_keyboard())
+        return
+    
+async def admin_removestudent_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+    _, _, row_str = query.data.partition(":")
+    await asyncio.to_thread(sheets.set_student_status, int(row_str), "inactive")
+    await query.edit_message_text("Student removed (marked inactive — history preserved).")
+
+
+async def admin_removegroup_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+    _, _, group_name = query.data.partition(":")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Yes, remove it", callback_data=f"admin_removegroup_confirm:{group_name}")],
+        [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
+    ])
+    await query.edit_message_text(f"Remove group *{_md(group_name)}*? This can't be undone from here.",
+                                   parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def admin_removegroup_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+    _, _, group_name = query.data.partition(":")
+    removed = await asyncio.to_thread(sheets.remove_group, group_name)
+    await query.edit_message_text(
+        f"Removed {group_name}." if removed else f"Couldn't find {group_name} — it may have already been removed."
+    )
+
+
+def _tuition_amount_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("$89", callback_data="admin_tuition_preset:89"),
+            InlineKeyboardButton("$119", callback_data="admin_tuition_preset:119"),
+        ],
+        [InlineKeyboardButton("✏️ Custom amount", callback_data="admin_tuition_preset:custom")],
+        [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
+    ])
+
+
+async def _finalize_addstudent(name: str, tg: str, group: str, amount) -> str:
+    await asyncio.to_thread(sheets.add_roster_student, name, tg, group)
+    try:
+        await asyncio.to_thread(sheets.add_finance_student, group, name, tg, amount, "Pending")
+    except Exception as exc:
+        log.warning("add_finance_student failed for %s in %s: %s", name, group, exc)
+        return (
+            f"Added {name} to Roster and {group}'s attendance tab, but couldn't create their "
+            f"Finance row automatically ({exc})."
+        )
+    return f"Added {name}" + (f" (@{tg})" if tg else " (no TG handle yet)") + f" to {group}, tuition ${amount} (Pending)."
+
+async def _finalize_edittuition(student_name: str, amount) -> str:
+    rec = await asyncio.to_thread(sheets.find_student, student_name)
+    if not rec:
+        return f"⚠️ No payment record found for {student_name}."
+    await asyncio.to_thread(sheets.set_finance_amount, rec["worksheet"], rec["row_number"], amount)
+    await asyncio.to_thread(sheets.log_payment_change, rec["name"], rec["tg"], rec["status"], "admin_override_tuition", amount)
+    return f"Updated {student_name}'s tuition to ${amount}."
+
+async def admin_tuition_preset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+    _, _, code = query.data.partition(":")
+    pending = context.user_data.get("pending_admin_action")
+    if not pending or pending.get("type") not in ("addstudent_amount", "edittuition_amount"):
+        await query.edit_message_text("That selection expired — start over with /admin.")
+        return
+    if code == "custom":
+        pending["awaiting_custom_amount"] = True
+        context.user_data["pending_admin_action"] = pending
+        await query.edit_message_text("Send the amount as a number (e.g. \"75\").")
+        return
+    amount = int(code)
+    if pending["type"] == "addstudent_amount":
+        result_msg = await _finalize_addstudent(pending["name"], pending["tg"], pending["group"], amount)
+    else:
+        result_msg = await _finalize_edittuition(pending["student"], amount)
+    context.user_data.pop("pending_admin_action", None)
+    await query.edit_message_text(result_msg)
+
+async def admin_addstudent_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+    pending = context.user_data.get("pending_admin_action")
+    if not pending or pending.get("type") != "addstudent_pick_group":
+        await query.edit_message_text("That selection expired — start over with /admin.")
+        return
+    _, _, group_name = query.data.partition(":")
+    context.user_data["pending_admin_action"] = {
+        "type": "addstudent_amount", "name": pending["name"], "tg": pending["tg"], "group": group_name,
+    }
+    await query.edit_message_text(f"What's {pending['name']}'s tuition for {group_name}?",
+                                   reply_markup=_tuition_amount_keyboard())
 
 async def admin_setpayment_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -587,6 +760,20 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
+    if pending.get("awaiting_custom_amount") and pending.get("type") in ("addstudent_amount", "edittuition_amount"):
+        try:
+            amount = int(float(text.replace("$", "").strip()))
+        except ValueError:
+            await update.message.reply_text("Couldn't parse that as a number — send just the amount, e.g. \"75\".")
+            return
+        if pending["type"] == "addstudent_amount":
+            result_msg = await _finalize_addstudent(pending["name"], pending["tg"], pending["group"], amount)
+        else:
+            result_msg = await _finalize_edittuition(pending["student"], amount)
+        await update.message.reply_text(result_msg)
+        context.user_data.pop("pending_admin_action", None)
+        return
+    
     if pending["type"] == "setpayment":
         matches = await asyncio.to_thread(sheets.search_roster, text)
         if not matches:
@@ -634,9 +821,206 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Added: {reason} ({points:+d}) for {student_name}.")
         except Exception as e:
             await update.message.reply_text(f"⚠️ Error adding penalty: {str(e)}")
+    
+    elif pending["type"] == "addstudent_name":
+        context.user_data["pending_admin_action"] = {"type": "addstudent_tg", "name": text}
+        await update.message.reply_text(
+            f"Name: {text}\n\nNow send their @username (or type \"none\" if they don't have one yet)."
+        )
+        return
+
+    elif pending["type"] == "addstudent_tg":
+        tg = "" if text.lower() == "none" else text.lstrip("@")
+        groups = await asyncio.to_thread(sheets.get_groups_schedule)
+        if not groups:
+            await update.message.reply_text("No groups exist yet — add a group first.")
+            return
+        buttons = [
+            [InlineKeyboardButton(g["name"], callback_data=f"admin_addstudent_group:{g['name']}")]
+            for g in groups
+        ]
+        context.user_data["pending_admin_action"] = {"type": "addstudent_pick_group", "name": pending["name"], "tg": tg}
+        await update.message.reply_text("Which group?", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    elif pending["type"] == "addgroup_name":
+        context.user_data["pending_admin_action"] = {"type": "addgroup_days", "name": text}
+        await update.message.reply_text(
+            f"Group name: {text}\n\nNow send the days it meets, comma-separated "
+            f"(use Mon/Tue/Wed/Thu/Fri/Sat/Sun) — e.g. \"Mon,Wed,Fri\"."
+        )
+        return
+
+    elif pending["type"] == "addgroup_days":
+        context.user_data["pending_admin_action"] = {"type": "addgroup_start", "name": pending["name"], "days": text}
+        await update.message.reply_text("Now send the start time (24h HH:MM, e.g. \"16:00\").")
+        return
+
+    elif pending["type"] == "addgroup_start":
+        context.user_data["pending_admin_action"] = {
+            "type": "addgroup_end", "name": pending["name"], "days": pending["days"], "start": text
+        }
+        await update.message.reply_text("Now send the end time (24h HH:MM, e.g. \"18:00\").")
+        return
+
+    elif pending["type"] == "addgroup_end":
+        await asyncio.to_thread(sheets.add_group, pending["name"], pending["days"], pending["start"], text)
+        await update.message.reply_text(
+            f"Group \"{pending['name']}\" created ({pending['days']}, {pending['start']}–{text}). "
+            f"Its attendance tab is ready — add students to it with ➕ Add student."
+        )
 
     context.user_data.pop("pending_admin_action", None)
 
+
+def get_group_report(group_name, start_date, end_date):
+    """Aggregates one group's stats for a report:
+    - payment: current status counts (live snapshot, not time-windowed —
+      payment status doesn't have a meaningful 'this week' version)
+    - attendance / homework: counts within [start_date, end_date] inclusive
+    - penalty_points_period: total points assigned in that window (Active or
+      Removed — this is about what was assigned, not current standing)
+    start_date/end_date are datetime.date objects.
+    """
+    payment_counts = {"Paid": 0, "Pending": 0, "Scholarship": 0, "Cancel": 0, "Other": 0}
+    for rec in iter_group_records():
+        if rec["group"] != group_name:
+            continue
+        s = rec["status"].strip()
+        if s in payment_counts:
+            payment_counts[s] += 1
+        else:
+            payment_counts["Other"] += 1
+
+    attendance_counts = {"Present": 0, "Late": 0, "Absent": 0}
+    ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
+    values = ws.get_all_values()
+    if len(values) >= 2:
+        headers = values[0]
+        idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Session Date", "Status")}
+        g_i, d_i, s_i = idx.get("Group"), idx.get("Session Date"), idx.get("Status")
+        for raw in values[1:]:
+            if g_i is None or g_i >= len(raw) or _norm(raw[g_i]) != group_name:
+                continue
+            d = _parse_session_date(_norm(raw[d_i])) if d_i is not None and d_i < len(raw) else None
+            if d is None or not (start_date <= d <= end_date):
+                continue
+            st = _norm(raw[s_i]) if s_i is not None and s_i < len(raw) else ""
+            if st in attendance_counts:
+                attendance_counts[st] += 1
+
+    homework_counts = {"On Time": 0, "Late": 0, "Missing": 0}
+    ws = get_admin_panel_spreadsheet().worksheet("Homework_Log")
+    values = ws.get_all_values()
+    if len(values) >= 2:
+        headers = values[0]
+        idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Due Datetime", "Status")}
+        g_i, d_i, s_i = idx.get("Group"), idx.get("Due Datetime"), idx.get("Status")
+        for raw in values[1:]:
+            if g_i is None or g_i >= len(raw) or _norm(raw[g_i]) != group_name:
+                continue
+            d = _parse_session_date(_norm(raw[d_i])) if d_i is not None and d_i < len(raw) else None
+            if d is None or not (start_date <= d <= end_date):
+                continue
+            st = _norm(raw[s_i]) if s_i is not None and s_i < len(raw) else ""
+            if st in homework_counts:
+                homework_counts[st] += 1
+
+    penalty_points_period = 0
+    ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
+    values = ws.get_all_values()
+    if len(values) >= 2:
+        headers = values[0]
+        idx = {c: _header_index(headers, c) for c in ("Group", "Points", "Timestamp")}
+        g_i, p_i, t_i = idx.get("Group"), idx.get("Points"), idx.get("Timestamp")
+        for raw in values[1:]:
+            if g_i is None or g_i >= len(raw) or _norm(raw[g_i]) != group_name:
+                continue
+            d = _parse_session_date(_norm(raw[t_i])) if t_i is not None and t_i < len(raw) else None
+            if d is None or not (start_date <= d <= end_date):
+                continue
+            try:
+                penalty_points_period += int(float(_norm(raw[p_i]) or 0)) if p_i is not None and p_i < len(raw) else 0
+            except ValueError:
+                pass
+
+    return {
+        "payment": payment_counts,
+        "attendance": attendance_counts,
+        "homework": homework_counts,
+        "penalty_points_period": penalty_points_period,
+    }
+
+def _report_timeframe(code: str):
+    today = datetime.date.today()
+    if code == "week":
+        start = today - datetime.timedelta(days=today.weekday())  # Monday
+        return start, today, "This week"
+    if code == "month":
+        return today.replace(day=1), today, "This month"
+    return datetime.date(2020, 1, 1), today, "All time"
+
+
+def _format_group_report(group_name: str, timeframe_label: str, data: dict) -> str:
+    p, a, h = data["payment"], data["attendance"], data["homework"]
+    lines = [
+        f"📊 *{_md(group_name)}* — {timeframe_label}\n",
+        f"💰 Payment: Paid {p['Paid']} | Pending {p['Pending']} | Scholarship {p['Scholarship']} | Cancel {p['Cancel']}",
+        f"📅 Attendance: Present {a['Present']} | Late {a['Late']} | Absent {a['Absent']}",
+        f"📚 Homework: On time {h['On Time']} | Late {h['Late']} | Missing {h['Missing']}",
+        f"⚠️ Penalty points assigned: {data['penalty_points_period']}",
+    ]
+    return "\n".join(lines)
+
+
+async def admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_update(update):
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("This week", callback_data="admin_report_tf:week")],
+        [InlineKeyboardButton("This month", callback_data="admin_report_tf:month")],
+        [InlineKeyboardButton("All time", callback_data="admin_report_tf:all")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="admin_menu:cancel")],
+    ])
+    await update.message.reply_text("📊 Report — pick a timeframe:", reply_markup=keyboard)
+
+
+async def admin_report_timeframe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+    _, _, code = query.data.partition(":")
+    context.user_data["report_timeframe"] = code
+
+    groups = await asyncio.to_thread(sheets.get_groups_schedule)
+    buttons = [[InlineKeyboardButton("📊 All groups", callback_data="admin_report_group:__all__")]]
+    buttons += [[InlineKeyboardButton(g["name"], callback_data=f"admin_report_group:{g['name']}")] for g in groups]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="admin_menu:cancel")])
+    await query.edit_message_text("Which group?", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def admin_report_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+    _, _, group_name = query.data.partition(":")
+    code = context.user_data.get("report_timeframe", "week")
+    start_date, end_date, label = _report_timeframe(code)
+
+    if group_name == "__all__":
+        groups = await asyncio.to_thread(sheets.get_groups_schedule)
+        reports = []
+        for g in groups:
+            data = await asyncio.to_thread(sheets.get_group_report, g["name"], start_date, end_date)
+            reports.append(_format_group_report(g["name"], label, data))
+        text = "\n\n".join(reports) if reports else "No groups found."
+    else:
+        data = await asyncio.to_thread(sheets.get_group_report, group_name, start_date, end_date)
+        text = _format_group_report(group_name, label, data)
+
+    await query.edit_message_text(text, parse_mode="Markdown")
 
 async def admin_setpayment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_update(update):
@@ -1095,6 +1479,14 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_group_callback, pattern=r"^admin_group:"))
     app.add_handler(CallbackQueryHandler(admin_pick_student_callback, pattern=r"^admin_pick:"))
     app.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admin_action:"))
+    app.add_handler(CommandHandler("admin_report", admin_report))
+    app.add_handler(CallbackQueryHandler(admin_report_timeframe_callback, pattern=r"^admin_report_tf:"))
+    app.add_handler(CallbackQueryHandler(admin_report_group_callback, pattern=r"^admin_report_group:"))
+    app.add_handler(CallbackQueryHandler(admin_removestudent_confirm_callback, pattern=r"^admin_removestudent_confirm:"))
+    app.add_handler(CallbackQueryHandler(admin_removegroup_pick_callback, pattern=r"^admin_removegroup_pick:"))
+    app.add_handler(CallbackQueryHandler(admin_removegroup_confirm_callback, pattern=r"^admin_removegroup_confirm:"))
+    app.add_handler(CallbackQueryHandler(admin_addstudent_group_callback, pattern=r"^admin_addstudent_group:"))
+    app.add_handler(CallbackQueryHandler(admin_tuition_preset_callback, pattern=r"^admin_tuition_preset:"))
     app.add_handler(CallbackQueryHandler(admin_sendreminder_callback, pattern=r"^admin_sendreminder:"))
     app.add_handler(CallbackQueryHandler(admin_penalty_preset_callback, pattern=r"^admin_penalty_preset:"))
     app.add_handler(CallbackQueryHandler(admin_removepenalty_row_callback, pattern=r"^admin_removepenalty_row:"))
