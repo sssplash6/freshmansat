@@ -873,83 +873,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("pending_admin_action", None)
 
 
-def get_group_report(group_name, start_date, end_date):
-    """Aggregates one group's stats for a report:
-    - payment: current status counts (live snapshot, not time-windowed —
-      payment status doesn't have a meaningful 'this week' version)
-    - attendance / homework: counts within [start_date, end_date] inclusive
-    - penalty_points_period: total points assigned in that window (Active or
-      Removed — this is about what was assigned, not current standing)
-    start_date/end_date are datetime.date objects.
-    """
-    payment_counts = {"Paid": 0, "Pending": 0, "Scholarship": 0, "Cancel": 0, "Other": 0}
-    for rec in iter_group_records():
-        if rec["group"] != group_name:
-            continue
-        s = rec["status"].strip()
-        if s in payment_counts:
-            payment_counts[s] += 1
-        else:
-            payment_counts["Other"] += 1
 
-    attendance_counts = {"Present": 0, "Late": 0, "Absent": 0}
-    ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
-    values = ws.get_all_values()
-    if len(values) >= 2:
-        headers = values[0]
-        idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Session Date", "Status")}
-        g_i, d_i, s_i = idx.get("Group"), idx.get("Session Date"), idx.get("Status")
-        for raw in values[1:]:
-            if g_i is None or g_i >= len(raw) or _norm(raw[g_i]) != group_name:
-                continue
-            d = _parse_session_date(_norm(raw[d_i])) if d_i is not None and d_i < len(raw) else None
-            if d is None or not (start_date <= d <= end_date):
-                continue
-            st = _norm(raw[s_i]) if s_i is not None and s_i < len(raw) else ""
-            if st in attendance_counts:
-                attendance_counts[st] += 1
-
-    homework_counts = {"On Time": 0, "Late": 0, "Missing": 0}
-    ws = get_admin_panel_spreadsheet().worksheet("Homework_Log")
-    values = ws.get_all_values()
-    if len(values) >= 2:
-        headers = values[0]
-        idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Due Datetime", "Status")}
-        g_i, d_i, s_i = idx.get("Group"), idx.get("Due Datetime"), idx.get("Status")
-        for raw in values[1:]:
-            if g_i is None or g_i >= len(raw) or _norm(raw[g_i]) != group_name:
-                continue
-            d = _parse_session_date(_norm(raw[d_i])) if d_i is not None and d_i < len(raw) else None
-            if d is None or not (start_date <= d <= end_date):
-                continue
-            st = _norm(raw[s_i]) if s_i is not None and s_i < len(raw) else ""
-            if st in homework_counts:
-                homework_counts[st] += 1
-
-    penalty_points_period = 0
-    ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
-    values = ws.get_all_values()
-    if len(values) >= 2:
-        headers = values[0]
-        idx = {c: _header_index(headers, c) for c in ("Group", "Points", "Timestamp")}
-        g_i, p_i, t_i = idx.get("Group"), idx.get("Points"), idx.get("Timestamp")
-        for raw in values[1:]:
-            if g_i is None or g_i >= len(raw) or _norm(raw[g_i]) != group_name:
-                continue
-            d = _parse_session_date(_norm(raw[t_i])) if t_i is not None and t_i < len(raw) else None
-            if d is None or not (start_date <= d <= end_date):
-                continue
-            try:
-                penalty_points_period += int(float(_norm(raw[p_i]) or 0)) if p_i is not None and p_i < len(raw) else 0
-            except ValueError:
-                pass
-
-    return {
-        "payment": payment_counts,
-        "attendance": attendance_counts,
-        "homework": homework_counts,
-        "penalty_points_period": penalty_points_period,
-    }
 
 def _report_timeframe(code: str):
     today = datetime.date.today()
@@ -1090,14 +1014,25 @@ async def approve_payment(bot, target_username: str, source: str) -> tuple[bool,
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled exception while processing update: %s", update, exc_info=context.error)
+    error_text = f"⚠️ Bot error: {type(context.error).__name__}: {context.error}"
+
+    # Always tell the admin group.
     if config.ADMIN_CHAT_ID:
         try:
-            await context.bot.send_message(
-                chat_id=config.ADMIN_CHAT_ID,
-                text=f"⚠️ Bot error: {type(context.error).__name__}: {context.error}",
-            )
+            await context.bot.send_message(chat_id=config.ADMIN_CHAT_ID, text=error_text)
         except Exception:
             pass
+
+    # Also tell whoever actually triggered it, if that's a different chat
+    # (e.g. an admin testing from their own DM), so it's not silently
+    # invisible to them.
+    if isinstance(update, Update):
+        origin_chat_id = update.effective_chat.id if update.effective_chat else None
+        if origin_chat_id and str(origin_chat_id) != str(config.ADMIN_CHAT_ID):
+            try:
+                await context.bot.send_message(chat_id=origin_chat_id, text=error_text)
+            except Exception:
+                pass
 
 
 async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
