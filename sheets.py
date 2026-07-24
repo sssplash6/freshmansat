@@ -7,10 +7,18 @@ All reads/writes to the spreadsheet go through here. Everything is synchronous
 Header matching is case-insensitive and whitespace-trimmed, and writes are
 aligned to the actual header positions found in each tab, so the code keeps
 working even if columns are renamed in casing or reordered.
+
+Hot-path Admin Panel tabs (Attendance_Log, Homework_Log, Penalty_Log,
+Roster, Payment_Log) are read through a short-lived (20s) in-memory cache
+to stay well under the Sheets API's 60-reads/minute-per-user quota during a
+burst of admin taps (browse -> profile -> back -> penalty -> back, etc.).
+Every write to a cached tab invalidates that tab's cache entry so the next
+read reflects the change immediately instead of serving stale data.
 """
 from __future__ import annotations
 
 import datetime
+import time
 
 import gspread
 import logging
@@ -27,6 +35,37 @@ _penalty_spreadsheet = None
 _admin_panel_spreadsheet = None
 _ws_cache: dict = {}
 _header_cache: dict = {}
+
+
+# --- Short-lived read cache (quota protection) ------------------------------
+_sheet_cache: dict = {}
+CACHE_TTL_SECONDS = 20  # short enough that admin actions still feel live
+
+
+def _cached_get_all_values(ws, cache_key):
+    """Wraps ws.get_all_values() with a short TTL cache, keyed by a string
+    you choose (usually the tab name). Cuts Sheets API read calls sharply
+    during a burst of admin taps without meaningfully staling the data —
+    20s old attendance counts are fine for an admin panel, they're not
+    real-time telemetry.
+    """
+    now = time.monotonic()
+    cached = _sheet_cache.get(cache_key)
+    if cached and (now - cached[0]) < CACHE_TTL_SECONDS:
+        return cached[1]
+    values = ws.get_all_values()
+    _sheet_cache[cache_key] = (now, values)
+    return values
+
+
+def invalidate_cache(cache_key=None):
+    """Call after any write to a tab whose reads are cached, so the very
+    next read reflects the change instead of serving stale cached data for
+    up to CACHE_TTL_SECONDS. Pass None to clear everything."""
+    if cache_key is None:
+        _sheet_cache.clear()
+    else:
+        _sheet_cache.pop(cache_key, None)
 
 
 # --- Connection ------------------------------------------------------------
@@ -165,7 +204,7 @@ def _build_row(headers, mapping):
     return row
 
 
-# --- Group tabs ------------------------------------------------------------
+# --- Group tabs (Finance spreadsheet) ---------------------------------------
 def get_group_worksheets():
     """Every worksheet that represents a student group (special tabs skipped)."""
     return [
@@ -176,7 +215,12 @@ def get_group_worksheets():
 
 
 def iter_group_records():
-    """Yield a dict for every data row across all group tabs."""
+    """Yield a dict for every data row across all group tabs.
+
+    Not cached — this touches many worksheets, each cheap and rarely called
+    in a tight burst (it's used by find_student, the reminder job, and
+    reports), so the 20s TTL cache isn't worth the complexity here.
+    """
     cols = (
         config.COL_NAME,
         config.COL_TG,
@@ -253,6 +297,7 @@ def get_bot_data_map():
         }
     return result
 
+
 def mark_pay_shown(username):
     """Record that this user has been shown payment details (via /pay or a reminder)."""
     ws = _bot_data_ws()
@@ -266,6 +311,7 @@ def mark_pay_shown(username):
         if normalize_username(row[config.BD_USERNAME]) == target:
             ws.update_cell(row["_row"], col + 1, today_str())
             return
+
 
 def find_bot_data_row(username):
     """Return the Bot Data record for ``username`` (or None)."""
@@ -285,6 +331,7 @@ def find_bot_data_row(username):
             }
     return None
 
+
 def clear_payment_proof(username):
     """Clear proof link/date for a user, e.g. after rejecting a submission."""
     ws = _bot_data_ws()
@@ -300,6 +347,7 @@ def clear_payment_proof(username):
             ws.update_cell(row["_row"], date_col + 1, "")
             return True
     return False
+
 
 def register_user(username, chat_id):
     """Ensure the user exists in Bot Data.
@@ -330,12 +378,12 @@ def register_user(username, chat_id):
     ws.append_row(new_row, value_input_option="USER_ENTERED")
     return "created"
 
+
 def set_finance_status(ws, row_number, status):
     """Sets Status for a specific row in a Finance group tab to any value
-    (Paid, Pending, Scholarship, Cancelled, etc.) — replaces the old
-    Paid-only / Unpaid-only functions with one generic write. Only updates
-    Date of Payment when the new status is Paid, so a historical record of
-    when they last paid is preserved even if status later changes again.
+    (Paid, Pending, Scholarship, Cancelled, etc.). Only updates Date of
+    Payment when the new status is Paid, so a historical record of when
+    they last paid is preserved even if status later changes again.
     """
     values = ws.get_all_values()
     header_i = _detect_header_row(values, (config.COL_STATUS, config.COL_DATE_OF_PAYMENT))
@@ -349,6 +397,7 @@ def set_finance_status(ws, row_number, status):
     if status.strip().lower() == "paid" and date_col is not None:
         ws.update_cell(row_number, date_col + 1, today_str())
 
+
 def set_finance_amount(ws, row_number, amount):
     """Updates just the Amount column for a specific Finance row — used by
     the 'Edit tuition' flow to correct/change an existing student's amount
@@ -359,6 +408,7 @@ def set_finance_amount(ws, row_number, amount):
     amount_col = _header_index(headers, config.COL_AMOUNT)
     if amount_col is not None:
         ws.update_cell(row_number, amount_col + 1, amount)
+
 
 def add_finance_student(group_tab_name, name, tg_handle, amount, status="Pending"):
     """Adds a new student row directly to a Finance group tab — creating
@@ -397,9 +447,6 @@ def add_finance_student(group_tab_name, name, tg_handle, amount, status="Pending
     _ws_cache.pop(group_tab_name, None)
 
 
-
-
-
 # --- Payment_Log tab (Admin Panel spreadsheet) ------------------------------
 _PAYMENT_LOG_TAB = "Payment_Log"
 _PAYMENT_LOG_HEADERS = ["Timestamp", "Student", "Username", "Status", "Amount", "Source"]
@@ -422,6 +469,7 @@ def log_payment_change(student_name, username, new_status, source, amount=""):
         [now_str(), student_name, normalize_username(username), new_status, amount, source],
         value_input_option="USER_ENTERED",
     )
+    invalidate_cache("Payment_Log")
 
 
 def set_payment_proof(username, link, date_str):
@@ -517,9 +565,9 @@ def append_send_log(group_tab, student_name, tg_contact, result, reminder_number
     ws.append_row(row, value_input_option="USER_ENTERED")
 
 
-# --- Admin Panel: Groups / Roster / Attendance_Log / Penalty_Log (read) ----
+# --- Admin Panel: Groups / Roster / Attendance_Log / Penalty_Log -----------
 # These read the SEPARATE Admin Panel spreadsheet (Code.gs's spreadsheet),
-# not the payment SHEET_ID above. Used by the attendance alert job.
+# not the payment SHEET_ID above.
 
 _ADMIN_GROUPS_COLS = ("Group Name", "Days", "Start Time", "End Time")
 _ADMIN_ROSTER_COLS = ("Student Name", "TG Handle", "Group")
@@ -534,7 +582,7 @@ def get_groups_schedule():
     {name, days: ['Mon','Wed',...], start_time: 'HH:MM'}.
     """
     ws = get_admin_panel_spreadsheet().worksheet("Groups")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Groups")
     if not values:
         return []
     headers = values[0]
@@ -555,32 +603,12 @@ def get_groups_schedule():
     return result
 
 
-def get_roster_map():
-    """Reads the Admin Panel's Roster tab into {student_name: {tg, group}}."""
-    ws = get_admin_panel_spreadsheet().worksheet("Roster")
-    values = ws.get_all_values()
-    if not values:
-        return {}
-    headers = values[0]
-    idx = {c: _header_index(headers, c) for c in _ADMIN_ROSTER_COLS}
-    result = {}
-    for raw in values[1:]:
-        def get(col):
-            i = idx.get(col)
-            return _norm(raw[i]) if (i is not None and i < len(raw)) else ""
-        name = get("Student Name")
-        if not name:
-            continue
-        result[name] = {"tg": get("TG Handle"), "group": get("Group")}
-    return result
-
-
 def get_todays_attendance_for_group(group_name, date_str):
     """Reads Attendance_Log rows for `group_name` whose Session Date matches
     `date_str` (YYYY-MM-DD), returning only Late/Absent rows.
     """
     ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Attendance_Log")
     if not values:
         return []
     headers = values[0]
@@ -595,10 +623,7 @@ def get_todays_attendance_for_group(group_name, date_str):
         if get("Status") not in ("Late", "Absent"):
             continue
         session_date_raw = get("Session Date")
-        # Session Date may be a full date string (e.g. from a Date-typed
-        # header cell) — match on just the YYYY-MM-DD portion.
         if not session_date_raw.startswith(date_str) and date_str not in session_date_raw:
-            # Fall back to parsing common formats if the direct match fails.
             try:
                 parsed = datetime.datetime.fromisoformat(session_date_raw[:19])
                 if parsed.strftime("%Y-%m-%d") != date_str:
@@ -612,7 +637,7 @@ def get_todays_attendance_for_group(group_name, date_str):
 def get_penalty_total(student_name):
     """Sums Active points for a student from the Admin Panel's Penalty_Log."""
     ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Penalty_Log")
     if not values:
         return 0
     headers = values[0]
@@ -654,7 +679,6 @@ def log_alert(key):
     _attendance_alert_log_ws().append_row([key])
 
 
-
 def search_roster(query):
     """Case-insensitive substring match against student name or TG handle.
     Returns a list of {name, tg, group} dicts — reads raw rows so a
@@ -680,7 +704,7 @@ def get_roster_rows(include_inactive=False):
     (e.g. searching up a departed student's history).
     """
     ws = get_admin_panel_spreadsheet().worksheet("Roster")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Roster")
     if len(values) < 2:
         return []
     headers = values[0]
@@ -722,6 +746,7 @@ def get_roster_by_group(group_name):
     appear in every group they're actually enrolled in."""
     return [row for row in get_roster_rows() if row["group"] == group_name]
 
+
 def get_students_for_group(group_name):
     """Alias used by the attendance-marking flow."""
     return get_roster_by_group(group_name)
@@ -750,7 +775,7 @@ def get_last_session_date(group_name):
     """Most recent Session Date logged for this group in Attendance_Log,
     as 'YYYY-MM-DD', or None if there's no history yet."""
     ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Attendance_Log")
     if len(values) < 2:
         return None
     headers = values[0]
@@ -771,7 +796,7 @@ def get_last_session_date(group_name):
 def get_attendance_for_date_group(date_str, group_name):
     """{student_name: status} already marked for this exact date+group."""
     ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Attendance_Log")
     if len(values) < 2:
         return {}
     headers = values[0]
@@ -792,7 +817,7 @@ def get_attendance_for_date_group(date_str, group_name):
 
 def _find_attendance_log_row(student_name, group_name, target_date):
     ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
-    values = ws.get_all_values()
+    values = ws.get_all_values()  # uncached — needs exact current row numbers for writes
     if len(values) < 2:
         return None, None
     headers = values[0]
@@ -809,7 +834,7 @@ def _find_attendance_log_row(student_name, group_name, target_date):
 
 def _remove_penalty_by_reason(student_name, reason):
     ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
-    values = ws.get_all_values()
+    values = ws.get_all_values()  # uncached — about to write, need current row numbers
     if len(values) < 2:
         return
     headers = values[0]
@@ -821,6 +846,7 @@ def _remove_penalty_by_reason(student_name, reason):
                 and r_i is not None and r_i < len(raw) and _norm(raw[r_i]) == reason
                 and st_i is not None and st_i < len(raw) and _norm(raw[st_i]) == "Active"):
             ws.update_cell(r, status_col + 1, "Removed")
+            invalidate_cache("Penalty_Log")
 
 
 def mark_attendance(date_str, group_name, student_name, status):
@@ -851,6 +877,7 @@ def mark_attendance(date_str, group_name, student_name, status):
     else:
         ws.append_row([now_str(), student_name, group_name, date_str, status, "Telegram Admin"],
                        value_input_option="USER_ENTERED")
+    invalidate_cache("Attendance_Log")
 
     if status == "Absent":
         add_manual_penalty(student_name, group_name, f"Unexcused absence ({date_str})", 1, "System")
@@ -858,7 +885,7 @@ def mark_attendance(date_str, group_name, student_name, status):
         # Count this student's total Late marks in this group to apply the
         # every-3rd-lateness rule, same as the Apps Script sync logic.
         ws2 = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
-        values = ws2.get_all_values()
+        values = ws2.get_all_values()  # uncached — need the just-written row counted
         headers = values[0]
         idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Status")}
         late_count = sum(
@@ -871,6 +898,7 @@ def mark_attendance(date_str, group_name, student_name, status):
             add_manual_penalty(student_name, group_name, f"Lateness ({date_str})", 1, "System")
 
     return True
+
 
 def add_roster_student(name, tg_handle, group):
     """Adds a student to Roster for a given group (Status: active).
@@ -911,6 +939,7 @@ def add_roster_student(name, tg_handle, group):
             if key in values_map:
                 row[i] = values_map[key]
         roster_ws.append_row(row, value_input_option="USER_ENTERED")
+    invalidate_cache("Roster")
 
     attendance_tab_name = f"Attendance - {group}"
     try:
@@ -936,6 +965,7 @@ def set_student_status(row_number, status):
     col = _header_index(headers, "Status")
     if col is not None:
         ws.update_cell(row_number, col + 1, status)
+    invalidate_cache("Roster")
 
 
 def get_roster_rows_for_student(student_name, include_inactive=True):
@@ -964,6 +994,7 @@ def add_group(name, days_csv, start_time, end_time):
             if key in values_map:
                 row[i] = values_map[key]
         groups_ws.append_row(row, value_input_option="USER_ENTERED")
+        invalidate_cache("Groups")
 
     tab_name = f"Attendance - {name}"
     try:
@@ -989,18 +1020,16 @@ def remove_group(name):
     for r, raw in enumerate(values[1:], start=2):
         if name_col < len(raw) and _norm(raw[name_col]) == name:
             ws.delete_rows(r)
+            invalidate_cache("Groups")
             return True
     return False
-
-
-
 
 
 def get_active_penalties(student_name):
     """Active Penalty_Log rows for a student, with sheet row numbers so they
     can be individually removed. Returns [{row_number, reason, points, group}]."""
     ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Penalty_Log")
     if len(values) < 2:
         return []
     headers = values[0]
@@ -1028,6 +1057,7 @@ def add_manual_penalty(student_name, group, reason, points, assigned_by):
         [now_str(), student_name, group, reason, points, "Manual", assigned_by, "Active"],
         value_input_option="USER_ENTERED",
     )
+    invalidate_cache("Penalty_Log")
 
 
 def remove_admin_panel_penalty(row_number):
@@ -1038,12 +1068,13 @@ def remove_admin_panel_penalty(row_number):
     status_col = _header_index(headers, "Status")
     if status_col is not None:
         ws.update_cell(row_number, status_col + 1, "Removed")
+    invalidate_cache("Penalty_Log")
 
 
 def get_latest_payment_status(username):
     """Most recent Payment_Log entry for a username, or None."""
     ws = get_admin_panel_spreadsheet().worksheet("Payment_Log")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Payment_Log")
     if len(values) < 2:
         return None
     headers = values[0]
@@ -1062,7 +1093,7 @@ def get_latest_payment_status(username):
 def get_student_profile(student_name):
     """Aggregates everything the admin panel needs for a full student card:
     roster info, attendance breakdown, homework breakdown, penalty total,
-    and latest payment status. Reads Admin Panel tabs only.
+    and latest payment status. Reads Admin Panel tabs only (cached).
 
     Attendance/homework/penalty totals are matched by student name alone
     (no group filter), so a student enrolled in multiple groups correctly
@@ -1089,7 +1120,7 @@ def get_student_profile(student_name):
     roster_status = "active" if active_rows else (matching_rows[-1]["status"] if matching_rows else "unknown")
 
     ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Attendance_Log")
     attendance_counts = {"Present": 0, "Late": 0, "Absent": 0}
     if len(values) >= 2:
         headers = values[0]
@@ -1103,7 +1134,7 @@ def get_student_profile(student_name):
                         attendance_counts[status] += 1
 
     ws = get_admin_panel_spreadsheet().worksheet("Homework_Log")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Homework_Log")
     homework_counts = {"On Time": 0, "Late": 0, "Missing": 0}
     if len(values) >= 2:
         headers = values[0]
@@ -1131,23 +1162,13 @@ def get_student_profile(student_name):
     }
 
 
-def reset_all_logs():
-    """Clears all data rows (keeping headers) from Attendance_Log,
-    Homework_Log, and Penalty_Log — a full reset so counts/penalties start
-    fresh from zero. Does NOT touch Roster, Groups, or Payment_Log (payment
-    history should stay intact even through a reset)."""
-    ss = get_admin_panel_spreadsheet()
-    for tab_name in ("Attendance_Log", "Homework_Log", "Penalty_Log"):
-        ws = ss.worksheet(tab_name)
-        if ws.row_count > 1:
-            ws.delete_rows(2, ws.row_count)
-
 def get_all_groups_report(group_names, start_date, end_date):
-    """Same output as calling get_group_report() once per group, but reads
-    Attendance_Log, Homework_Log, Penalty_Log, and the Finance tabs exactly
-    ONCE total instead of once per group — avoids the 429 quota errors that
-    happen when generating an 'all groups' report hits the Sheets API in a
-    tight burst. Returns {group_name: report_dict}.
+    """Same output as calling a per-group report once for each group, but
+    reads Attendance_Log, Homework_Log, Penalty_Log, and the Finance tabs
+    exactly ONCE total instead of once per group — this is what actually
+    avoids the 429 quota errors an 'all groups' report would otherwise cause
+    by bursting many full-sheet reads within a couple seconds.
+    Returns {group_name: report_dict}.
     """
     reports = {g: {
         "payment": {"Paid": 0, "Pending": 0, "Scholarship": 0, "Cancel": 0, "Other": 0},
@@ -1167,7 +1188,7 @@ def get_all_groups_report(group_names, start_date, end_date):
             reports[g]["payment"]["Other"] += 1
 
     ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Attendance_Log")
     if len(values) >= 2:
         headers = values[0]
         idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Session Date", "Status")}
@@ -1184,7 +1205,7 @@ def get_all_groups_report(group_names, start_date, end_date):
                 reports[g]["attendance"][st] += 1
 
     ws = get_admin_panel_spreadsheet().worksheet("Homework_Log")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Homework_Log")
     if len(values) >= 2:
         headers = values[0]
         idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Due Datetime", "Status")}
@@ -1201,7 +1222,7 @@ def get_all_groups_report(group_names, start_date, end_date):
                 reports[g]["homework"][st] += 1
 
     ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
-    values = ws.get_all_values()
+    values = _cached_get_all_values(ws, "Penalty_Log")
     if len(values) >= 2:
         headers = values[0]
         idx = {c: _header_index(headers, c) for c in ("Group", "Points", "Timestamp", "Status")}
@@ -1221,6 +1242,20 @@ def get_all_groups_report(group_names, start_date, end_date):
                 pass
 
     return reports
+
+
+def reset_all_logs():
+    """Clears all data rows (keeping headers) from Attendance_Log,
+    Homework_Log, and Penalty_Log — a full reset so counts/penalties start
+    fresh from zero. Does NOT touch Roster, Groups, or Payment_Log (payment
+    history should stay intact even through a reset)."""
+    ss = get_admin_panel_spreadsheet()
+    for tab_name in ("Attendance_Log", "Homework_Log", "Penalty_Log"):
+        ws = ss.worksheet(tab_name)
+        if ws.row_count > 1:
+            ws.delete_rows(2, ws.row_count)
+        invalidate_cache(tab_name)
+
 
 _PL_COLS = (
     config.PL_TG_HANDLE,
