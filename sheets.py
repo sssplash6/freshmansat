@@ -410,6 +410,20 @@ def set_finance_amount(ws, row_number, amount):
         ws.update_cell(row_number, amount_col + 1, amount)
 
 
+def _find_worksheet_ci(ss, title):
+    """Case/whitespace-tolerant worksheet lookup. Used instead of a plain
+    ss.worksheet(title) exact match, since that raised WorksheetNotFound for
+    an existing tab (likely a whitespace/casing mismatch or a stale cached
+    sheet list) and then tried to CREATE a duplicate, which Google correctly
+    rejected. Scanning ss.worksheets() directly avoids that failure mode.
+    """
+    target = title.strip().lower()
+    for ws in ss.worksheets():
+        if ws.title.strip().lower() == target:
+            return ws
+    return None
+
+
 def add_finance_student(group_tab_name, name, tg_handle, amount, status="Pending"):
     """Adds a new student row directly to a Finance group tab — creating
     that tab (with proper headers) first if it doesn't exist yet, so this
@@ -424,13 +438,11 @@ def add_finance_student(group_tab_name, name, tg_handle, amount, status="Pending
     """
     ss = get_spreadsheet()
     cols = (config.COL_NAME, config.COL_TG, config.COL_AMOUNT, config.COL_STATUS, config.COL_DATE_OF_PAYMENT)
-    try:
-        ws = ss.worksheet(group_tab_name)
-        values = ws.get_all_values()
-    except gspread.exceptions.WorksheetNotFound:
+    ws = _find_worksheet_ci(ss, group_tab_name)
+    if ws is None:
         ws = ss.add_worksheet(title=group_tab_name, rows=200, cols=len(cols))
         ws.append_row(list(cols))
-        values = ws.get_all_values()
+    values = ws.get_all_values()
 
     header_i = _detect_header_row(values, cols) if values else 0
     headers = values[header_i] if values else list(cols)
@@ -444,6 +456,7 @@ def add_finance_student(group_tab_name, name, tg_handle, amount, status="Pending
 
     # Clear the cached worksheet lookup so future find_student()/iter_group_records()
     # calls see the row we just added.
+    _ws_cache.pop(ws.title, None)
     _ws_cache.pop(group_tab_name, None)
 
 

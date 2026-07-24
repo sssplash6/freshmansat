@@ -14,6 +14,7 @@ import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from oauthlib.uri_validate import query
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -38,6 +39,29 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
+
+from telegram.error import BadRequest
+
+async def safe_edit_text(query, text, **kwargs):
+    """Wraps query.edit_message_text, swallowing Telegram's harmless
+    'Message is not modified' BadRequest — fires on a double-tap or when an
+    edit sends the exact same content the message already has. Any other
+    BadRequest is re-raised since that could be a real problem.
+    """
+    try:
+        await safe_edit_text(query,text, **kwargs)
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
+async def safe_edit_caption(query, caption, **kwargs):
+    """Same as safe_edit_text, for edit_message_caption."""
+    try:
+        await safe_edit_caption(query,caption=caption, **kwargs)
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
 
 
 def is_admin_update(update: Update) -> bool:
@@ -259,7 +283,7 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if action == "cancel":
         context.user_data.pop("pending_admin_action", None)
-        await query.edit_message_text("Cancelled.")
+        await safe_edit_text(query,"Cancelled.")
         return
 
     if action == "setpayment":
@@ -274,43 +298,43 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             ],
             [InlineKeyboardButton("⬅️ Cancel menu", callback_data="admin_menu:cancel")],
         ])
-        await query.edit_message_text("Set status to:", reply_markup=keyboard)
+        await safe_edit_text(query,"Set status to:", reply_markup=keyboard)
         return
 
     if action == "browse":
         groups = await asyncio.to_thread(sheets.get_groups_schedule)
         buttons = [[InlineKeyboardButton(g["name"], callback_data=f"admin_group:{g['name']}")] for g in groups]
         buttons.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
-        await query.edit_message_text("Pick a group:", reply_markup=InlineKeyboardMarkup(buttons))
+        await safe_edit_text(query,"Pick a group:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if action == "search":
         context.user_data["pending_admin_action"] = {"type": "search_student"}
-        await query.edit_message_text("Send part of a student's name or @username to search for.")
+        await safe_edit_text(query,"Send part of a student's name or @username to search for.")
         return
 
     if action == "attendance":
-        await _show_attendance_group_picker(query.edit_message_text)
+        await _show_attendance_group_picker(safe_edit_text)
         return
     
     if action == "addstudent":
         context.user_data["pending_admin_action"] = {"type": "addstudent_name"}
-        await query.edit_message_text("New student — send their full name.")
+        await safe_edit_text(query, "New student — send their full name.")
         return
 
     if action == "addgroup":
         context.user_data["pending_admin_action"] = {"type": "addgroup_name"}
-        await query.edit_message_text("New group — send the group name (e.g. \"Padawan Offline 2\").")
+        await safe_edit_text(query, "New group — send the group name (e.g. \"Padawan Offline 2\").")
         return
 
     if action == "removegroup":
         groups = await asyncio.to_thread(sheets.get_groups_schedule)
         if not groups:
-            await query.edit_message_text("No groups found.")
+            await safe_edit_text(query, "No groups found.")
             return
         buttons = [[InlineKeyboardButton(g["name"], callback_data=f"admin_removegroup_pick:{g['name']}")] for g in groups]
         buttons.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
-        await query.edit_message_text(
+        await safe_edit_text(query,
             "Pick a group to remove.\n\nThis only removes it from scheduling/syncing — "
             "students, attendance history, and logs are kept untouched.",
             reply_markup=InlineKeyboardMarkup(buttons),
@@ -333,12 +357,12 @@ async def admin_group_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     _, _, group_name = query.data.partition(":")
     students = await asyncio.to_thread(sheets.get_roster_by_group, group_name)
     if not students:
-        await query.edit_message_text(f"No students found in {group_name}.")
+        await safe_edit_text(query, f"No students found in {group_name}.")
         return
 
     buttons = [[InlineKeyboardButton(s["name"], callback_data=f"admin_pick:{s['name']}")] for s in students]
     buttons.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
-    await query.edit_message_text(f"{group_name} — pick a student:", reply_markup=InlineKeyboardMarkup(buttons))
+    await safe_edit_text(query, f"{group_name} — pick a student:", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_pick_student_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,7 +383,7 @@ async def admin_pick_student_callback(update: Update, context: ContextTypes.DEFA
         [InlineKeyboardButton("✏️ Edit tuition", callback_data="admin_action:edittuition")],
         [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
     ])
-    await query.edit_message_text(f"*{_md(student_name)}* — what would you like to do?",
+    await safe_edit_text(query,f"*{_md(student_name)}* — what would you like to do?",
                                    parse_mode="Markdown", reply_markup=keyboard)
 
 
@@ -401,7 +425,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     student_name = context.user_data.get("selected_student")
     if not student_name:
-        await query.edit_message_text("No student selected — start over with /admin.")
+        await safe_edit_text(query, "No student selected — start over with /admin.")
         return
 
     _, _, action = query.data.partition(":")
@@ -409,7 +433,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if action == "profile":
         profile = await asyncio.to_thread(sheets.get_student_profile, student_name)
         if not profile:
-            await query.edit_message_text(f"No profile data found for {student_name}.")
+            await safe_edit_text(query, f"No profile data found for {student_name}.")
             return
         buttons = []
         payment = profile.get("payment")
@@ -417,7 +441,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if is_unpaid and profile.get("tg"):
             buttons.append([InlineKeyboardButton("📨 Send reminder", callback_data=f"admin_sendreminder:{student_name}")])
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")])
-        await query.edit_message_text(_format_student_profile(profile), parse_mode="Markdown",
+        await safe_edit_text(query, _format_student_profile(profile), parse_mode="Markdown",
                                        reply_markup=InlineKeyboardMarkup(buttons))
         return
 
@@ -430,7 +454,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("✏️ Custom (type points + reason)", callback_data="admin_penalty_preset:custom")],
             [InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")],
         ])
-        await query.edit_message_text(f"Add penalty for *{_md(student_name)}* — pick a reason:",
+        await safe_edit_text(query, f"Add penalty for *{_md(student_name)}* — pick a reason:",
                                        parse_mode="Markdown", reply_markup=keyboard)
         return
 
@@ -438,7 +462,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         penalties = await asyncio.to_thread(sheets.get_active_penalties, student_name)
         if not penalties:
             buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
-            await query.edit_message_text(f"{student_name} has no active penalties.",
+            await safe_edit_text(query, f"{student_name} has no active penalties.",
                                            reply_markup=InlineKeyboardMarkup(buttons))
             return
         buttons = [
@@ -446,7 +470,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             for p in penalties
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")])
-        await query.edit_message_text(f"Remove which penalty for *{_md(student_name)}*?",
+        await safe_edit_text(query, f"Remove which penalty for *{_md(student_name)}*?",
                                        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
@@ -462,21 +486,21 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             ],
             [InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")],
         ])
-        await query.edit_message_text("Set status to:", reply_markup=keyboard)
+        await safe_edit_text(query, "Set status to:", reply_markup=keyboard)
         return
     
     if action == "removestudent":
         rows = await asyncio.to_thread(sheets.get_roster_rows_for_student, student_name, False)
         active_rows = [r for r in rows if r["status"].lower() == "active"]
         if not active_rows:
-            await query.edit_message_text(f"{student_name} has no active roster entries to remove.")
+            await safe_edit_text(query, f"{student_name} has no active roster entries to remove.")
             return
         if len(active_rows) == 1:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes, remove", callback_data=f"admin_removestudent_confirm:{active_rows[0]['row_number']}")],
                 [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
             ])
-            await query.edit_message_text(
+            await safe_edit_text(query,
                 f"Remove *{_md(student_name)}* from {active_rows[0]['group']}?\n\n"
                 f"This keeps all their history — it just marks them inactive.",
                 parse_mode="Markdown", reply_markup=keyboard,
@@ -487,7 +511,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 for r in active_rows
             ]
             buttons.append([InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")])
-            await query.edit_message_text(
+            await safe_edit_text(query,
                 f"*{_md(student_name)}* is enrolled in multiple groups — remove from which one?",
                 parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
             )
@@ -495,7 +519,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if action == "edittuition":
         context.user_data["pending_admin_action"] = {"type": "edittuition_amount", "student": student_name}
-        await query.edit_message_text(f"New tuition for *{_md(student_name)}*:", parse_mode="Markdown",
+        await safe_edit_text(query, f"New tuition for *{_md(student_name)}*:", parse_mode="Markdown",
                                        reply_markup=_tuition_amount_keyboard())
         return
     
@@ -506,7 +530,7 @@ async def admin_removestudent_confirm_callback(update: Update, context: ContextT
         return
     _, _, row_str = query.data.partition(":")
     await asyncio.to_thread(sheets.set_student_status, int(row_str), "inactive")
-    await query.edit_message_text("Student removed (marked inactive — history preserved).")
+    await safe_edit_text(query, "Student removed (marked inactive — history preserved).")
 
 
 async def admin_removegroup_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -519,7 +543,7 @@ async def admin_removegroup_pick_callback(update: Update, context: ContextTypes.
         [InlineKeyboardButton("✅ Yes, remove it", callback_data=f"admin_removegroup_confirm:{group_name}")],
         [InlineKeyboardButton("⬅️ Cancel", callback_data="admin_menu:cancel")],
     ])
-    await query.edit_message_text(f"Remove group *{_md(group_name)}*? This can't be undone from here.",
+    await safe_edit_text(query, f"Remove group *{_md(group_name)}*? This can't be undone from here.",
                                    parse_mode="Markdown", reply_markup=keyboard)
 
 
@@ -530,7 +554,7 @@ async def admin_removegroup_confirm_callback(update: Update, context: ContextTyp
         return
     _, _, group_name = query.data.partition(":")
     removed = await asyncio.to_thread(sheets.remove_group, group_name)
-    await query.edit_message_text(
+    await safe_edit_text(query,
         f"Removed {group_name}." if removed else f"Couldn't find {group_name} — it may have already been removed."
     )
 
@@ -574,12 +598,12 @@ async def admin_tuition_preset_callback(update: Update, context: ContextTypes.DE
     _, _, code = query.data.partition(":")
     pending = context.user_data.get("pending_admin_action")
     if not pending or pending.get("type") not in ("addstudent_amount", "edittuition_amount"):
-        await query.edit_message_text("That selection expired — start over with /admin.")
+        await safe_edit_text(query, "That selection expired — start over with /admin.")
         return
     if code == "custom":
         pending["awaiting_custom_amount"] = True
         context.user_data["pending_admin_action"] = pending
-        await query.edit_message_text("Send the amount as a number (e.g. \"75\").")
+        await safe_edit_text(query, "Send the amount as a number (e.g. \"75\").")
         return
     amount = int(code)
     if pending["type"] == "addstudent_amount":
@@ -587,7 +611,7 @@ async def admin_tuition_preset_callback(update: Update, context: ContextTypes.DE
     else:
         result_msg = await _finalize_edittuition(pending["student"], amount)
     context.user_data.pop("pending_admin_action", None)
-    await query.edit_message_text(result_msg)
+    await safe_edit_text(query, result_msg)
 
 async def admin_addstudent_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -596,14 +620,14 @@ async def admin_addstudent_group_callback(update: Update, context: ContextTypes.
         return
     pending = context.user_data.get("pending_admin_action")
     if not pending or pending.get("type") != "addstudent_pick_group":
-        await query.edit_message_text("That selection expired — start over with /admin.")
+        await safe_edit_text(query, "That selection expired — start over with /admin.")
         return
     _, _, group_name = query.data.partition(":")
     context.user_data["pending_admin_action"] = {
         "type": "addstudent_amount", "name": pending["name"], "tg": pending["tg"], "group": group_name,
     }
-    await query.edit_message_text(f"What's {pending['name']}'s tuition for {group_name}?",
-                                   reply_markup=_tuition_amount_keyboard())
+    await safe_edit_text(query, f"What's {pending['name']}'s tuition for {group_name}?",
+                         reply_markup=_tuition_amount_keyboard())
 
 async def admin_setpayment_execute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -613,7 +637,7 @@ async def admin_setpayment_execute_callback(update: Update, context: ContextType
 
     student_name = context.user_data.get("selected_student")
     if not student_name:
-        await query.edit_message_text("No student selected — start over with /admin.")
+        await safe_edit_text(query, "No student selected — start over with /admin.")
         return
 
     _, _, status = query.data.partition(":")
@@ -621,7 +645,7 @@ async def admin_setpayment_execute_callback(update: Update, context: ContextType
     rec = await asyncio.to_thread(sheets.find_student, student_name)
     if not rec:
         buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
-        await query.edit_message_text(
+        await safe_edit_text(query,
             f"⚠️ No payment record found for {student_name} in the payment sheet at all — "
             f"they may be missing a row there entirely.",
             reply_markup=InlineKeyboardMarkup(buttons),
@@ -632,7 +656,7 @@ async def admin_setpayment_execute_callback(update: Update, context: ContextType
     success, msg = await set_payment_status(context.bot, target_username, status, source="admin_override")
     result_msg = (f"✅ {msg}" if success else f"⚠️ {msg}")
     buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
-    await query.edit_message_text(result_msg, reply_markup=InlineKeyboardMarkup(buttons))
+    await safe_edit_text(query, result_msg, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_sendreminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -644,13 +668,13 @@ async def admin_sendreminder_callback(update: Update, context: ContextTypes.DEFA
     _, _, student_name = query.data.partition(":")
     profile = await asyncio.to_thread(sheets.get_student_profile, student_name)
     if not profile or not profile.get("tg"):
-        await query.edit_message_text(f"{student_name} has no TG handle on file — can't send a reminder.")
+        await safe_edit_text(query, f"{student_name} has no TG handle on file — can't send a reminder.")
         return
 
     success, msg = await jobs.send_manual_reminder(context.bot, profile["tg"].lstrip("@"))
     result_msg = (f"✅ {msg}" if success else f"⚠️ {msg}")
     buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
-    await query.edit_message_text(result_msg, reply_markup=InlineKeyboardMarkup(buttons))
+    await safe_edit_text(query, result_msg, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_penalty_preset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -661,14 +685,14 @@ async def admin_penalty_preset_callback(update: Update, context: ContextTypes.DE
 
     student_name = context.user_data.get("selected_student")
     if not student_name:
-        await query.edit_message_text("No student selected — start over with /admin.")
+        await safe_edit_text(query, "No student selected — start over with /admin.")
         return
 
     _, _, preset_key = query.data.partition(":")
 
     if preset_key == "custom":
         context.user_data["pending_admin_action"] = {"type": "addpenalty_custom", "student": student_name}
-        await query.edit_message_text(
+        await safe_edit_text(query,
             f"Adding a custom penalty for *{_md(student_name)}*.\n\n"
             f"Send it as: `<points> <reason text>` — e.g. `2 Disrupting class`",
             parse_mode="Markdown",
@@ -685,7 +709,7 @@ async def admin_penalty_preset_callback(update: Update, context: ContextTypes.DE
         msg = f"⚠️ Error adding penalty: {str(e)}"
 
     buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
-    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
+    await safe_edit_text(query, msg, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_removepenalty_row_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -704,7 +728,7 @@ async def admin_removepenalty_row_callback(update: Update, context: ContextTypes
         msg = f"⚠️ Error removing penalty: {str(e)}"
 
     buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
-    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
+    await safe_edit_text(query, msg, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_setpayment_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -715,13 +739,13 @@ async def admin_setpayment_pick_callback(update: Update, context: ContextTypes.D
 
     pending = context.user_data.get("pending_admin_action")
     if not pending or pending.get("type") != "setpayment":
-        await query.edit_message_text("That selection expired — start over with /admin.")
+        await safe_edit_text(query, "That selection expired — start over with /admin.")
         return
 
     _, _, student_name = query.data.partition(":")
     profile = await asyncio.to_thread(sheets.get_student_profile, student_name)
     if not profile or not profile.get("tg"):
-        await query.edit_message_text(f"{student_name} has no TG handle on file — can't set payment status.")
+        await safe_edit_text(query, f"{student_name} has no TG handle on file — can't set payment status.")
         context.user_data.pop("pending_admin_action", None)
         return
 
@@ -730,7 +754,7 @@ async def admin_setpayment_pick_callback(update: Update, context: ContextTypes.D
 
     result_msg = (f"✅ {msg}" if success else f"⚠️ {msg}")
     buttons = [[InlineKeyboardButton("⬅️ Back", callback_data=f"admin_pick:{student_name}")]]
-    await query.edit_message_text(result_msg, reply_markup=InlineKeyboardMarkup(buttons))
+    await safe_edit_text(query, result_msg, reply_markup=InlineKeyboardMarkup(buttons))
     context.user_data.pop("pending_admin_action", None)
 
 
@@ -743,7 +767,7 @@ async def admin_setpayment_status_callback(update: Update, context: ContextTypes
 
     _, _, status_label = query.data.partition(":")
     context.user_data["pending_admin_action"] = {"type": "setpayment", "status": status_label}
-    await query.edit_message_text(
+    await safe_edit_text(query,
         f"Setting status to *{status_label}*.\n\n"
         f"Now send the student's name or @username (partial is fine — I'll match it).",
         parse_mode="Markdown",
@@ -799,11 +823,11 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif pending["type"] == "search_student":
         matches = await asyncio.to_thread(sheets.search_roster, text)
         if not matches:
-            await update.message.reply_text(f"No matches for '{text}'.")
+            await safe_edit_text(query, f"No matches for '{text}'.")
         else:
             buttons = [[InlineKeyboardButton(f"{m['name']} ({m['group']})", callback_data=f"admin_pick:{m['name']}")]
                        for m in matches]
-            await update.message.reply_text(
+            await safe_edit_text(query,
                 f"Found {len(matches)} match(es):", reply_markup=InlineKeyboardMarkup(buttons)
             )
 
@@ -921,7 +945,7 @@ async def admin_report_timeframe_callback(update: Update, context: ContextTypes.
     buttons = [[InlineKeyboardButton("📊 All groups", callback_data="admin_report_group:__all__")]]
     buttons += [[InlineKeyboardButton(g["name"], callback_data=f"admin_report_group:{g['name']}")] for g in groups]
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="admin_menu:cancel")])
-    await query.edit_message_text("Which group?", reply_markup=InlineKeyboardMarkup(buttons))
+    await safe_edit_text(query, "Which group?", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def admin_report_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -996,18 +1020,18 @@ async def proof_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     base_caption = query.message.caption or ""
 
     if not bd_entry or not bd_entry.get("chat_id"):
-        await query.edit_message_caption(caption=base_caption + "\n\n⚠️ No linked chat found.")
+        await safe_edit_text(query, base_caption + "\n\n⚠️ No linked chat found.")
         return
 
     if action == "reject":
         await asyncio.to_thread(sheets.clear_payment_proof, target_username)
         await notify_student(context.bot, int(bd_entry["chat_id"]), text=messages.proof_rejected())
-        await query.edit_message_caption(caption=base_caption + "\n\n❌ Rejected")
+        await safe_edit_text(query, base_caption + "\n\n❌ Rejected")
 
     elif action == "approve":
         success, _ = await approve_payment(context.bot, target_username, source="proof")
         suffix = "\n\n✅ Approved" if success else "\n\n⚠️ Approval failed — check logs."
-        await query.edit_message_caption(caption=base_caption + suffix)
+        await safe_edit_text(query, base_caption + suffix)
 
 
 async def approve_payment(bot, target_username: str, source: str) -> tuple[bool, str]:
@@ -1034,7 +1058,7 @@ async def admin_reset_confirm_callback(update: Update, context: ContextTypes.DEF
     if not is_admin_update(update):
         return
     await asyncio.to_thread(sheets.reset_all_logs)
-    await query.edit_message_text("✅ Attendance, homework, and penalty logs have been cleared. Starting fresh from zero.")
+    await safe_edit_text(query, "✅ Attendance, homework, and penalty logs have been cleared. Starting fresh from zero.")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled exception while processing update: %s", update, exc_info=context.error)
@@ -1188,7 +1212,7 @@ async def attendance_cancel_callback(update: Update, context: ContextTypes.DEFAU
     context.user_data.pop("attendance_students", None)
     context.user_data.pop("attendance_marks", None)
 
-    await query.edit_message_text("Cancelled.")
+    await safe_edit_text(query,"Cancelled.")
 
 
 async def attendance_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1221,7 +1245,8 @@ async def attendance_group_callback(update: Update, context: ContextTypes.DEFAUL
 
     buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="attendance:back_to_groups")])
 
-    await query.edit_message_text(
+    await safe_edit_text(
+        query,
         f"👥 {group_name}\n\n📅 Pick a date:",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
@@ -1272,7 +1297,7 @@ async def attendance_date_callback(update: Update, context: ContextTypes.DEFAULT
 
     students = await asyncio.to_thread(sheets.get_students_for_group, group_name)
     if not students:
-        await query.edit_message_text(f"No students found in {group_name}.")
+        await safe_edit_text(query,f"No students found in {group_name}.")
         return
 
     current_attendance = await asyncio.to_thread(sheets.get_attendance_for_date_group, date_str, group_name)
@@ -1285,7 +1310,8 @@ async def attendance_date_callback(update: Update, context: ContextTypes.DEFAULT
             marks[idx] = existing
     context.user_data["attendance_marks"] = marks
 
-    await query.edit_message_text(
+    await safe_edit_text(
+        query,
         f"👥 {group_name} | 📅 {date_str}\n\nTap a status for each student:",
         reply_markup=InlineKeyboardMarkup(_build_attendance_keyboard(students, marks))
     )
@@ -1313,7 +1339,8 @@ async def attendance_mark_callback(update: Update, context: ContextTypes.DEFAULT
 
     group_name = context.user_data.get("attendance_group")
     date_str = context.user_data.get("attendance_date")
-    await query.edit_message_text(
+    await safe_edit_text(
+        query,
         f"👥 {group_name} | 📅 {date_str}\n\nTap a status for each student:",
         reply_markup=InlineKeyboardMarkup(_build_attendance_keyboard(students, marks))
     )
@@ -1339,7 +1366,8 @@ async def attendance_change_callback(update: Update, context: ContextTypes.DEFAU
 
     group_name = context.user_data.get("attendance_group")
     date_str = context.user_data.get("attendance_date")
-    await query.edit_message_text(
+    await safe_edit_text(
+        query,
         f"👥 {group_name} | 📅 {date_str}\n\nTap a status for each student:",
         reply_markup=InlineKeyboardMarkup(_build_attendance_keyboard(students, marks))
     )
@@ -1386,7 +1414,7 @@ async def attendance_submit_callback(update: Update, context: ContextTypes.DEFAU
     buttons = [
         [InlineKeyboardButton("📅 Mark another date/group", callback_data="attendance:back_to_groups")],
     ]
-    await query.edit_message_text("\n".join(report_lines), reply_markup=InlineKeyboardMarkup(buttons))
+    await safe_edit_text(query, "\n".join(report_lines), reply_markup=InlineKeyboardMarkup(buttons))
 
     context.user_data.pop("attendance_group", None)
     context.user_data.pop("attendance_date", None)
