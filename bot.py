@@ -14,7 +14,6 @@ import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from oauthlib.uri_validate import query
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -49,7 +48,7 @@ async def safe_edit_text(query, text, **kwargs):
     BadRequest is re-raised since that could be a real problem.
     """
     try:
-        await safe_edit_text(query,text, **kwargs)
+        await query.edit_message_text(text, **kwargs)
     except BadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             raise
@@ -58,11 +57,10 @@ async def safe_edit_text(query, text, **kwargs):
 async def safe_edit_caption(query, caption, **kwargs):
     """Same as safe_edit_text, for edit_message_caption."""
     try:
-        await safe_edit_caption(query,caption=caption, **kwargs)
+        await query.edit_message_caption(caption=caption, **kwargs)
     except BadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             raise
-
 
 def is_admin_update(update: Update) -> bool:
     """True if this update is from the admin group OR from a whitelisted
@@ -314,7 +312,7 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if action == "attendance":
-        await _show_attendance_group_picker(safe_edit_text)
+        await _show_attendance_group_picker(lambda t, **kw: safe_edit_text(query, t, **kw))
         return
     
     if action == "addstudent":
@@ -820,14 +818,15 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Found {len(matches)} matches — which one?", reply_markup=InlineKeyboardMarkup(buttons)
             )
             return
+        
     elif pending["type"] == "search_student":
         matches = await asyncio.to_thread(sheets.search_roster, text)
         if not matches:
-            await safe_edit_text(query, f"No matches for '{text}'.")
+            await update.message.reply_text(f"No matches for '{text}'.")
         else:
             buttons = [[InlineKeyboardButton(f"{m['name']} ({m['group']})", callback_data=f"admin_pick:{m['name']}")]
                        for m in matches]
-            await safe_edit_text(query,
+            await update.message.reply_text(
                 f"Found {len(matches)} match(es):", reply_markup=InlineKeyboardMarkup(buttons)
             )
 
@@ -1258,7 +1257,7 @@ async def attendance_back_to_groups_callback(update: Update, context: ContextTyp
     if not is_admin_update(update):
         return
     context.user_data.pop("attendance_group", None)
-    await _show_attendance_group_picker(query.edit_message_text)
+    await _show_attendance_group_picker(lambda t, **kw: safe_edit_text(query, t, **kw))
 
 
 def _build_attendance_keyboard(students: list, marks: dict) -> list:
