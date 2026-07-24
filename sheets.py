@@ -1130,26 +1130,42 @@ def get_student_profile(student_name):
         "payment": payment,
     }
 
-def get_group_report(group_name, start_date, end_date):
-    """Aggregates one group's stats for a report:
-    - payment: current status counts (live snapshot, not time-windowed —
-      payment status doesn't have a meaningful 'this week' version)
-    - attendance / homework: counts within [start_date, end_date] inclusive
-    - penalty_points_period: total points assigned in that window (Active or
-      Removed — this is about what was assigned, not current standing)
-    start_date/end_date are datetime.date objects.
+
+def reset_all_logs():
+    """Clears all data rows (keeping headers) from Attendance_Log,
+    Homework_Log, and Penalty_Log — a full reset so counts/penalties start
+    fresh from zero. Does NOT touch Roster, Groups, or Payment_Log (payment
+    history should stay intact even through a reset)."""
+    ss = get_admin_panel_spreadsheet()
+    for tab_name in ("Attendance_Log", "Homework_Log", "Penalty_Log"):
+        ws = ss.worksheet(tab_name)
+        if ws.row_count > 1:
+            ws.delete_rows(2, ws.row_count)
+
+def get_all_groups_report(group_names, start_date, end_date):
+    """Same output as calling get_group_report() once per group, but reads
+    Attendance_Log, Homework_Log, Penalty_Log, and the Finance tabs exactly
+    ONCE total instead of once per group — avoids the 429 quota errors that
+    happen when generating an 'all groups' report hits the Sheets API in a
+    tight burst. Returns {group_name: report_dict}.
     """
-    payment_counts = {"Paid": 0, "Pending": 0, "Scholarship": 0, "Cancel": 0, "Other": 0}
+    reports = {g: {
+        "payment": {"Paid": 0, "Pending": 0, "Scholarship": 0, "Cancel": 0, "Other": 0},
+        "attendance": {"Present": 0, "Late": 0, "Absent": 0},
+        "homework": {"On Time": 0, "Late": 0, "Missing": 0},
+        "penalty_points_period": 0,
+    } for g in group_names}
+
     for rec in iter_group_records():
-        if rec["group"] != group_name:
+        g = rec["group"]
+        if g not in reports:
             continue
         s = rec["status"].strip()
-        if s in payment_counts:
-            payment_counts[s] += 1
+        if s in reports[g]["payment"]:
+            reports[g]["payment"][s] += 1
         else:
-            payment_counts["Other"] += 1
+            reports[g]["payment"]["Other"] += 1
 
-    attendance_counts = {"Present": 0, "Late": 0, "Absent": 0}
     ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
     values = ws.get_all_values()
     if len(values) >= 2:
@@ -1157,16 +1173,16 @@ def get_group_report(group_name, start_date, end_date):
         idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Session Date", "Status")}
         g_i, d_i, s_i = idx.get("Group"), idx.get("Session Date"), idx.get("Status")
         for raw in values[1:]:
-            if g_i is None or g_i >= len(raw) or _norm(raw[g_i]) != group_name:
+            g = _norm(raw[g_i]) if g_i is not None and g_i < len(raw) else ""
+            if g not in reports:
                 continue
             d = _parse_session_date(_norm(raw[d_i])) if d_i is not None and d_i < len(raw) else None
             if d is None or not (start_date <= d <= end_date):
                 continue
             st = _norm(raw[s_i]) if s_i is not None and s_i < len(raw) else ""
-            if st in attendance_counts:
-                attendance_counts[st] += 1
+            if st in reports[g]["attendance"]:
+                reports[g]["attendance"][st] += 1
 
-    homework_counts = {"On Time": 0, "Late": 0, "Missing": 0}
     ws = get_admin_panel_spreadsheet().worksheet("Homework_Log")
     values = ws.get_all_values()
     if len(values) >= 2:
@@ -1174,39 +1190,37 @@ def get_group_report(group_name, start_date, end_date):
         idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Due Datetime", "Status")}
         g_i, d_i, s_i = idx.get("Group"), idx.get("Due Datetime"), idx.get("Status")
         for raw in values[1:]:
-            if g_i is None or g_i >= len(raw) or _norm(raw[g_i]) != group_name:
+            g = _norm(raw[g_i]) if g_i is not None and g_i < len(raw) else ""
+            if g not in reports:
                 continue
             d = _parse_session_date(_norm(raw[d_i])) if d_i is not None and d_i < len(raw) else None
             if d is None or not (start_date <= d <= end_date):
                 continue
             st = _norm(raw[s_i]) if s_i is not None and s_i < len(raw) else ""
-            if st in homework_counts:
-                homework_counts[st] += 1
+            if st in reports[g]["homework"]:
+                reports[g]["homework"][st] += 1
 
-    penalty_points_period = 0
     ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
     values = ws.get_all_values()
     if len(values) >= 2:
         headers = values[0]
-        idx = {c: _header_index(headers, c) for c in ("Group", "Points", "Timestamp")}
-        g_i, p_i, t_i = idx.get("Group"), idx.get("Points"), idx.get("Timestamp")
+        idx = {c: _header_index(headers, c) for c in ("Group", "Points", "Timestamp", "Status")}
+        g_i, p_i, t_i, st_i = idx.get("Group"), idx.get("Points"), idx.get("Timestamp"), idx.get("Status")
         for raw in values[1:]:
-            if g_i is None or g_i >= len(raw) or _norm(raw[g_i]) != group_name:
+            g = _norm(raw[g_i]) if g_i is not None and g_i < len(raw) else ""
+            if g not in reports:
                 continue
+            if st_i is not None and st_i < len(raw) and _norm(raw[st_i]) == "Removed":
+                continue  # don't count reversed/corrected penalties
             d = _parse_session_date(_norm(raw[t_i])) if t_i is not None and t_i < len(raw) else None
             if d is None or not (start_date <= d <= end_date):
                 continue
             try:
-                penalty_points_period += int(float(_norm(raw[p_i]) or 0)) if p_i is not None and p_i < len(raw) else 0
+                reports[g]["penalty_points_period"] += int(float(_norm(raw[p_i]) or 0)) if p_i is not None and p_i < len(raw) else 0
             except ValueError:
                 pass
 
-    return {
-        "payment": payment_counts,
-        "attendance": attendance_counts,
-        "homework": homework_counts,
-        "penalty_points_period": penalty_points_period,
-    }
+    return reports
 
 _PL_COLS = (
     config.PL_TG_HANDLE,

@@ -923,7 +923,6 @@ async def admin_report_timeframe_callback(update: Update, context: ContextTypes.
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="admin_menu:cancel")])
     await query.edit_message_text("Which group?", reply_markup=InlineKeyboardMarkup(buttons))
 
-
 async def admin_report_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -933,18 +932,21 @@ async def admin_report_group_callback(update: Update, context: ContextTypes.DEFA
     code = context.user_data.get("report_timeframe", "week")
     start_date, end_date, label = _report_timeframe(code)
 
-    if group_name == "__all__":
-        groups = await asyncio.to_thread(sheets.get_groups_schedule)
-        reports = []
-        for g in groups:
-            data = await asyncio.to_thread(sheets.get_group_report, g["name"], start_date, end_date)
-            reports.append(_format_group_report(g["name"], label, data))
-        text = "\n\n".join(reports) if reports else "No groups found."
-    else:
-        data = await asyncio.to_thread(sheets.get_group_report, group_name, start_date, end_date)
-        text = _format_group_report(group_name, label, data)
+    groups = await asyncio.to_thread(sheets.get_groups_schedule)
+    all_names = [g["name"] for g in groups]
+    reports = await asyncio.to_thread(sheets.get_all_groups_report, all_names, start_date, end_date)
 
-    await query.edit_message_text(text, parse_mode="Markdown")
+    if group_name == "__all__":
+        text = "\n\n".join(_format_group_report(g, label, reports[g]) for g in all_names) if all_names else "No groups found."
+    else:
+        text = _format_group_report(group_name, label, reports.get(group_name, {
+            "payment": {"Paid": 0, "Pending": 0, "Scholarship": 0, "Cancel": 0},
+            "attendance": {"Present": 0, "Late": 0, "Absent": 0},
+            "homework": {"On Time": 0, "Late": 0, "Missing": 0},
+            "penalty_points_period": 0,
+        }))
+
+    await safe_edit_text(query, text, parse_mode="Markdown")
 
 async def admin_setpayment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_update(update):
@@ -1011,6 +1013,28 @@ async def proof_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def approve_payment(bot, target_username: str, source: str) -> tuple[bool, str]:
     return await set_payment_status(bot, target_username, "Paid", source=source)
 
+
+async def admin_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_update(update):
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚠️ Yes, wipe attendance/homework/penalties", callback_data="admin_reset_confirm")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="admin_menu:cancel")],
+    ])
+    await update.message.reply_text(
+        "This will permanently clear ALL attendance, homework, and penalty history "
+        "(Roster and payment history are kept). Are you sure?",
+        reply_markup=keyboard,
+    )
+
+
+async def admin_reset_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin_update(update):
+        return
+    await asyncio.to_thread(sheets.reset_all_logs)
+    await query.edit_message_text("✅ Attendance, homework, and penalty logs have been cleared. Starting fresh from zero.")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled exception while processing update: %s", update, exc_info=context.error)
@@ -1416,6 +1440,8 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admin_action:"))
     app.add_handler(CommandHandler("admin_report", admin_report))
     app.add_handler(CallbackQueryHandler(admin_report_timeframe_callback, pattern=r"^admin_report_tf:"))
+    app.add_handler(CommandHandler("admin_reset", admin_reset))
+    app.add_handler(CallbackQueryHandler(admin_reset_confirm_callback, pattern=r"^admin_reset_confirm$"))
     app.add_handler(CallbackQueryHandler(admin_report_group_callback, pattern=r"^admin_report_group:"))
     app.add_handler(CallbackQueryHandler(admin_removestudent_confirm_callback, pattern=r"^admin_removestudent_confirm:"))
     app.add_handler(CallbackQueryHandler(admin_removegroup_pick_callback, pattern=r"^admin_removegroup_pick:"))
