@@ -1286,17 +1286,21 @@ def get_all_groups_report(group_names, start_date, end_date):
 
     return reports
 
-
 def reset_all_logs():
-    """Clears all data rows (keeping headers) from Attendance_Log,
-    Homework_Log, and Penalty_Log — a full reset so counts/penalties start
-    fresh from zero. Does NOT touch Roster, Groups, or Payment_Log (payment
-    history should stay intact even through a reset)."""
+    """Clears all data (keeping headers) from Attendance_Log, Homework_Log,
+    and Penalty_Log by clearing cell values in the used range, NOT deleting
+    rows — Google Sheets refuses to delete every non-frozen row, which is
+    what caused the previous version to crash. Does NOT touch Roster,
+    Groups, or Payment_Log."""
     ss = get_admin_panel_spreadsheet()
     for tab_name in ("Attendance_Log", "Homework_Log", "Penalty_Log"):
         ws = ss.worksheet(tab_name)
-        if ws.row_count > 1:
-            ws.delete_rows(2, ws.row_count)
+        values = ws.get_all_values()
+        if len(values) > 1:
+            last_row = len(values)
+            last_col = max(len(r) for r in values) if values else ws.col_count
+            end_a1 = gspread.utils.rowcol_to_a1(last_row, last_col)
+            ws.batch_clear([f"A2:{end_a1}"])
         invalidate_cache(tab_name)
 
 

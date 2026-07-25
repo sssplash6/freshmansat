@@ -200,7 +200,7 @@ async def set_payment_status(bot, target_username: str, status_label: str, sourc
 
     bd_entry = await asyncio.to_thread(sheets.find_bot_data_row, target_username)
 
-    await asyncio.to_thread(sheets.set_student_status, rec["worksheet"], rec["row_number"], status_label)
+    await asyncio.to_thread(sheets.set_finance_status, rec["worksheet"], rec["row_number"], status_label)
     await asyncio.to_thread(
         sheets.log_payment_change, rec["name"], target_username, status_label, source, rec["amount"]
     )
