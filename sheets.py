@@ -37,13 +37,43 @@ _ws_cache: dict = {}
 _header_cache: dict = {}
 
 
+# --- Retry wrapper for transient Google API errors --------------------------
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
+
+
+def _get_all_values_retry(ws, max_attempts=3):
+    """Wraps ws.get_all_values() with retry-with-backoff for transient
+    Google Sheets API errors (429 quota, 500/502/503 server-side hiccups).
+    Waits 1s, then 2s, then gives up and re-raises on the 3rd failure.
+    Non-transient errors (e.g. permissions, bad range) are raised immediately.
+    """
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return ws.get_all_values()
+        except gspread.exceptions.APIError as exc:
+            status = None
+            try:
+                status = exc.response.status_code
+            except Exception:
+                pass
+            last_exc = exc
+            if status not in _RETRYABLE_STATUS_CODES or attempt == max_attempts - 1:
+                raise
+            wait = 2 ** attempt  # 1s, 2s
+            log.warning("Sheets API error (status=%s), retrying in %ss (attempt %d/%d): %s",
+                        status, wait, attempt + 1, max_attempts, exc)
+            time.sleep(wait)
+    raise last_exc
+
+
 # --- Short-lived read cache (quota protection) ------------------------------
 _sheet_cache: dict = {}
 CACHE_TTL_SECONDS = 20  # short enough that admin actions still feel live
 
 
 def _cached_get_all_values(ws, cache_key):
-    """Wraps ws.get_all_values() with a short TTL cache, keyed by a string
+    """Wraps _get_all_values_retry(ws) with a short TTL cache, keyed by a string
     you choose (usually the tab name). Cuts Sheets API read calls sharply
     during a burst of admin taps without meaningfully staling the data —
     20s old attendance counts are fine for an admin panel, they're not
@@ -53,7 +83,7 @@ def _cached_get_all_values(ws, cache_key):
     cached = _sheet_cache.get(cache_key)
     if cached and (now - cached[0]) < CACHE_TTL_SECONDS:
         return cached[1]
-    values = ws.get_all_values()
+    values = _get_all_values_retry(ws)
     _sheet_cache[cache_key] = (now, values)
     return values
 
@@ -177,7 +207,7 @@ def _read(ws, cols):
     0-based position, and each row dict carries ``_row`` (1-based sheet row) plus
     the requested columns' trimmed string values.
     """
-    values = ws.get_all_values()
+    values = _get_all_values_retry(ws)
     if not values:
         return [], {c: None for c in cols}, []
     header_i = _detect_header_row(values, cols)
@@ -385,7 +415,7 @@ def set_finance_status(ws, row_number, status):
     Payment when the new status is Paid, so a historical record of when
     they last paid is preserved even if status later changes again.
     """
-    values = ws.get_all_values()
+    values = _get_all_values_retry(ws)
     header_i = _detect_header_row(values, (config.COL_STATUS, config.COL_DATE_OF_PAYMENT))
     headers = values[header_i]
 
@@ -402,7 +432,7 @@ def set_finance_amount(ws, row_number, amount):
     """Updates just the Amount column for a specific Finance row — used by
     the 'Edit tuition' flow to correct/change an existing student's amount
     owed without touching their Status."""
-    values = ws.get_all_values()
+    values = _get_all_values_retry(ws)
     header_i = _detect_header_row(values, (config.COL_AMOUNT,))
     headers = values[header_i]
     amount_col = _header_index(headers, config.COL_AMOUNT)
@@ -442,7 +472,7 @@ def add_finance_student(group_tab_name, name, tg_handle, amount, status="Pending
     if ws is None:
         ws = ss.add_worksheet(title=group_tab_name, rows=200, cols=len(cols))
         ws.append_row(list(cols))
-    values = ws.get_all_values()
+    values = _get_all_values_retry(ws)
 
     header_i = _detect_header_row(values, cols) if values else 0
     headers = values[header_i] if values else list(cols)
@@ -509,7 +539,7 @@ def set_payment_proof(username, link, date_str):
 def _cached_headers(ws, cols, cache_key):
     """Detect and cache a worksheet's header row (headers are stable)."""
     if cache_key not in _header_cache:
-        vals = ws.get_all_values()
+        vals = _get_all_values_retry(ws)
         _header_cache[cache_key] = vals[_detect_header_row(vals, cols)] if vals else []
     return _header_cache[cache_key]
 
@@ -682,7 +712,7 @@ def _attendance_alert_log_ws():
 def get_alerted_keys():
     """Dedup guard so the same student/session never gets alerted twice."""
     ws = _attendance_alert_log_ws()
-    values = ws.get_all_values()
+    values = _get_all_values_retry(ws)
     if len(values) < 2:
         return set()
     return {row[0] for row in values[1:] if row}
@@ -830,7 +860,7 @@ def get_attendance_for_date_group(date_str, group_name):
 
 def _find_attendance_log_row(student_name, group_name, target_date):
     ws = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
-    values = ws.get_all_values()  # uncached — needs exact current row numbers for writes
+    values = _get_all_values_retry(ws)  # uncached — needs exact current row numbers for writes
     if len(values) < 2:
         return None, None
     headers = values[0]
@@ -847,7 +877,7 @@ def _find_attendance_log_row(student_name, group_name, target_date):
 
 def _remove_penalty_by_reason(student_name, reason):
     ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
-    values = ws.get_all_values()  # uncached — about to write, need current row numbers
+    values = _get_all_values_retry(ws)  # uncached — about to write, need current row numbers
     if len(values) < 2:
         return
     headers = values[0]
@@ -898,7 +928,7 @@ def mark_attendance(date_str, group_name, student_name, status):
         # Count this student's total Late marks in this group to apply the
         # every-3rd-lateness rule, same as the Apps Script sync logic.
         ws2 = get_admin_panel_spreadsheet().worksheet("Attendance_Log")
-        values = ws2.get_all_values()  # uncached — need the just-written row counted
+        values = _get_all_values_retry(ws2)  # uncached — need the just-written row counted
         headers = values[0]
         idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Status")}
         late_count = sum(
@@ -957,7 +987,7 @@ def add_roster_student(name, tg_handle, group):
     attendance_tab_name = f"Attendance - {group}"
     try:
         attendance_ws = ss.worksheet(attendance_tab_name)
-        existing_names = [r[0] for r in attendance_ws.get_all_values()[1:]] if attendance_ws.row_count > 1 else []
+        existing_names = [r[0] for r in _get_all_values_retry(attendance_ws)[1:]] if attendance_ws.row_count > 1 else []
         if name not in existing_names:
             attendance_ws.append_row([name, tg_handle], value_input_option="USER_ENTERED")
     except gspread.exceptions.WorksheetNotFound:
@@ -1025,7 +1055,7 @@ def remove_group(name):
     Returns True if a row was found and deleted, False otherwise.
     """
     ws = get_admin_panel_spreadsheet().worksheet("Groups")
-    values = ws.get_all_values()
+    values = _get_all_values_retry(ws)
     headers = values[0]
     name_col = _header_index(headers, "Group Name")
     if name_col is None:
@@ -1076,7 +1106,7 @@ def add_manual_penalty(student_name, group, reason, points, assigned_by):
 def remove_admin_panel_penalty(row_number):
     """Soft-deletes a Penalty_Log row by setting Status to 'Removed'."""
     ws = get_admin_panel_spreadsheet().worksheet("Penalty_Log")
-    values = ws.get_all_values()
+    values = _get_all_values_retry(ws)
     headers = values[0]
     status_col = _header_index(headers, "Status")
     if status_col is not None:
@@ -1290,7 +1320,7 @@ def find_penalty_record(username):
         return None
 
     ws = get_penalty_spreadsheet().worksheet(config.PENALTY_LOOKUP_TAB)
-    values = ws.get_all_values()
+    values = _get_all_values_retry(ws)
     if not values:
         return None
 
