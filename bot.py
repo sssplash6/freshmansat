@@ -237,6 +237,7 @@ async def set_bot_commands(app: Application):
         BotCommand("admin_setpayment", "Set a student's payment status directly"),
         BotCommand("reject", "Reject a student's payment proof"),
         BotCommand("admin_report", "Weekly/monthly stats per group"),
+        BotCommand("admin_reset", "Wipe attendance/homework/penalty history"),
     ]
     admin_chat_ids = set()
     if config.ADMIN_CHAT_ID:
@@ -263,6 +264,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➕ Add student", callback_data="admin_menu:addstudent")],
         [InlineKeyboardButton("➕ Add group", callback_data="admin_menu:addgroup")],
         [InlineKeyboardButton("🗑 Remove group", callback_data="admin_menu:removegroup")],
+        [InlineKeyboardButton("🔄 Reset all data (start fresh)", callback_data="admin_menu:reset")],
         [InlineKeyboardButton("❌ Cancel", callback_data="admin_menu:cancel")],
     ])
     await update.message.reply_text(
@@ -323,6 +325,18 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if action == "addgroup":
         context.user_data["pending_admin_action"] = {"type": "addgroup_name"}
         await safe_edit_text(query, "New group — send the group name (e.g. \"Padawan Offline 2\").")
+        return
+
+    if action == "reset":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚠️ Yes, wipe attendance/homework/penalties", callback_data="admin_reset_confirm")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_menu:cancel")],
+        ])
+        await safe_edit_text(query,
+            "This will permanently clear ALL attendance, homework, and penalty history "
+            "(Roster and payment history are kept). Are you sure?",
+            reply_markup=keyboard,
+        )
         return
 
     if action == "removegroup":
