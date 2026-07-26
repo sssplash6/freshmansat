@@ -42,13 +42,19 @@ log = logging.getLogger("bot")
 from telegram.error import BadRequest
 
 async def safe_edit_text(query, text, **kwargs):
-    """Wraps query.edit_message_text, swallowing Telegram's harmless
-    'Message is not modified' BadRequest — fires on a double-tap or when an
-    edit sends the exact same content the message already has. Any other
-    BadRequest is re-raised since that could be a real problem.
+    """Edit either text or a caption, depending on the callback message type.
+
+    Photo-based admin proof messages are sent with a caption, so editing them
+    with edit_message_text raises Telegram's 'There is no text in the message
+    to edit' BadRequest. This helper detects that and uses caption editing.
     """
+    message = getattr(query, "message", None)
+    is_photo_message = bool(getattr(message, "photo", None))
     try:
-        await query.edit_message_text(text, **kwargs)
+        if is_photo_message:
+            await query.edit_message_caption(caption=text, **kwargs)
+        else:
+            await query.edit_message_text(text, **kwargs)
     except BadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             raise
@@ -1113,6 +1119,7 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ You're already marked as paid. No action needed.")
         return
 
+    await asyncio.to_thread(sheets.register_user, username, update.message.chat_id)
     await update.message.reply_text(messages.pay_info(rec["name"], rec["amount"]))
     await asyncio.to_thread(sheets.mark_pay_shown, username)
 
