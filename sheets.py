@@ -1191,7 +1191,8 @@ def get_student_profile(student_name):
                         homework_counts[status] += 1
 
     total_points = get_penalty_total(student_name)
-    payment = get_latest_payment_status(tg) if tg else None
+    finance_rec = find_student(tg) if tg else None
+    payment = {"status": finance_rec["status"], "amount": finance_rec["amount"], "timestamp": ""} if finance_rec else None
 
     return {
         "name": student_name,

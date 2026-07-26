@@ -1113,11 +1113,8 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ You're already marked as paid. No action needed.")
         return
 
-    caption = messages.pay_info(rec["name"], rec["amount"])
-    with open(config.PAYME_QR_FILE, "rb") as photo:
-        await update.message.reply_photo(photo=photo, caption=caption)
+    await update.message.reply_text(messages.pay_info(rec["name"], rec["amount"]))
     await asyncio.to_thread(sheets.mark_pay_shown, username)
-
 
 # --- Scheduler lifecycle ---------------------------------------------------
 async def on_startup(app: Application):

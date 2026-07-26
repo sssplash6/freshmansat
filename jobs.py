@@ -195,11 +195,8 @@ async def run_reminders(bot):
         caption = messages.reminder_text(rec["name"], rec["amount"], reminder_number)
 
         try:
-            with open(config.PAYME_QR_FILE, "rb") as photo:
-                await notify_student(
-                    bot, int(entry["chat_id"]), photo=photo, caption=caption
-                )
-        except Exception as exc:  # network / blocked / bad chat_id
+            await notify_student(bot, int(entry["chat_id"]), text=caption)
+        except Exception as exc:
             log.warning("Reminder to %s failed: %s", rec["tg"], exc)
             await asyncio.to_thread(
                 sheets.append_send_log,
@@ -238,8 +235,7 @@ async def send_manual_reminder(bot, username: str) -> tuple[bool, str]:
     reminder_number = await asyncio.to_thread(sheets.count_sent, username) + 1
     caption = messages.reminder_text(rec["name"], rec["amount"], reminder_number)
     try:
-        with open(config.PAYME_QR_FILE, "rb") as photo:
-            await notify_student(bot, int(bd_entry["chat_id"]), photo=photo, caption=caption)
+        await notify_student(bot, int(bd_entry["chat_id"]), text=caption)
     except Exception as exc:
         return False, f"Failed to send: {exc}"
 

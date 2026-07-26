@@ -117,9 +117,7 @@ def _stripe_line(amount: str) -> str:
 
 def _payment_options(amount: str) -> str:
     return (
-        "You can pay either way:\n"
-        f"{_stripe_line(amount)}\n"
-        "📱 Payme: scan the QR code below.\n\n"
+        f"{_stripe_line(amount)}\n\n"
         "📸 After paying, please send a screenshot of your payment as a photo "
         "here, so we can verify it."
     )
