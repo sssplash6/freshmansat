@@ -1044,7 +1044,10 @@ async def proof_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "reject":
         await asyncio.to_thread(sheets.clear_payment_proof, target_username)
-        await notify_student(context.bot, int(bd_entry["chat_id"]), text=messages.proof_rejected())
+        try:
+            await notify_student(context.bot, int(bd_entry["chat_id"]), text=messages.proof_rejected())
+        except Exception as exc:
+            log.warning("Could not notify @%s of proof rejection: %s", target_username, exc)
         await safe_edit_text(query, base_caption + "\n\n❌ Rejected")
 
     elif action == "approve":
@@ -1122,6 +1125,7 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(sheets.register_user, username, update.message.chat_id)
     await update.message.reply_text(messages.pay_info(rec["name"], rec["amount"]))
     await asyncio.to_thread(sheets.mark_pay_shown, username)
+    await asyncio.to_thread(sheets.register_user, username, update.message.chat_id)
 
 # --- Scheduler lifecycle ---------------------------------------------------
 async def on_startup(app: Application):
