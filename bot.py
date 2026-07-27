@@ -1409,17 +1409,16 @@ async def attendance_submit_callback(update: Update, context: ContextTypes.DEFAU
         await query.answer("No attendance marked", show_alert=True)
         return
 
+    marks_by_name = {students[idx]["name"]: status for idx, status in marks.items()}
     failed = []
-    for idx, status in marks.items():
-        student_name = students[idx]["name"]
-        success = await asyncio.to_thread(
-            sheets.mark_attendance, date_str, group_name, student_name, status
-        )
-        if not success:
-            failed.append(student_name)
-        else:
+    try:
+        await asyncio.to_thread(sheets.submit_attendance_batch, date_str, group_name, marks_by_name)
+        for student_name, status in marks_by_name.items():
             log.info(f"Attendance submitted: {student_name} ({group_name}) on {date_str} → {status}")
-
+    except Exception as exc:
+        log.exception("Batch attendance submit failed: %s", exc)
+        failed = list(marks_by_name.keys()) 
+        
     summary = {s: sum(1 for v in marks.values() if v == s) for s in _STATUS_ORDER}
     unmarked = len(students) - len(marks)
 

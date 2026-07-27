@@ -942,6 +942,101 @@ def mark_attendance(date_str, group_name, student_name, status):
 
     return True
 
+def submit_attendance_batch(date_str, group_name, marks: dict) -> None:
+    """Writes an entire class's attendance in one batch instead of looping
+    mark_attendance() per student — that old approach did 3-5 full sheet
+    reads/writes PER student (60-100+ API calls for a 20-student class),
+    which is what made Submit slow. This does the whole thing in ~5 calls
+    total regardless of class size.
+
+    marks: {student_name: status}
+    """
+    ss = get_admin_panel_spreadsheet()
+    ws_att = ss.worksheet("Attendance_Log")
+    att_values = ws_att.get_all_values()  # ONE read, whole function
+    headers = att_values[0] if att_values else ["Timestamp", "Student", "Group", "Session Date", "Status", "Marked By"]
+    idx = {c: _header_index(headers, c) for c in ("Student", "Group", "Session Date", "Status")}
+    s_i, g_i, d_i, st_i = idx.get("Student"), idx.get("Group"), idx.get("Session Date"), idx.get("Status")
+
+    target_date = datetime.date.fromisoformat(date_str)
+
+    existing_row = {}   # student -> (row_number, old_status)
+    late_counts = {}    # student -> pre-submission all-time Late count in this group
+    for r, raw in enumerate(att_values[1:], start=2):
+        student = _norm(raw[s_i]) if s_i is not None and s_i < len(raw) else ""
+        group = _norm(raw[g_i]) if g_i is not None and g_i < len(raw) else ""
+        if group != group_name or student not in marks:
+            continue
+        status_val = _norm(raw[st_i]) if st_i is not None and st_i < len(raw) else ""
+        if status_val == "Late":
+            late_counts[student] = late_counts.get(student, 0) + 1
+        d = _parse_session_date(_norm(raw[d_i])) if d_i is not None and d_i < len(raw) else None
+        if d == target_date:
+            existing_row[student] = (r, status_val)
+
+    ws_pen = ss.worksheet("Penalty_Log")
+    pen_values = ws_pen.get_all_values()  # ONE read, whole function
+    pen_headers = pen_values[0] if pen_values else []
+    p_idx = {c: _header_index(pen_headers, c) for c in ("Student", "Reason", "Status")}
+    ps_i, pr_i, pst_i = p_idx.get("Student"), p_idx.get("Reason"), p_idx.get("Status")
+    pen_status_col = p_idx.get("Status")
+
+    rows_to_remove_penalty = []
+    for r, raw in enumerate(pen_values[1:], start=2):
+        student = _norm(raw[ps_i]) if ps_i is not None and ps_i < len(raw) else ""
+        if student not in marks or student not in existing_row:
+            continue
+        reason = _norm(raw[pr_i]) if pr_i is not None and pr_i < len(raw) else ""
+        status_val = _norm(raw[pst_i]) if pst_i is not None and pst_i < len(raw) else ""
+        if status_val != "Active":
+            continue
+        old_status = existing_row[student][1]
+        if (old_status == "Absent" and reason == f"Unexcused absence ({date_str})") or \
+           (old_status == "Late" and reason == f"Lateness ({date_str})"):
+            rows_to_remove_penalty.append(r)
+
+    if rows_to_remove_penalty and pen_status_col is not None:
+        cells = [gspread.Cell(r, pen_status_col + 1, "Removed") for r in rows_to_remove_penalty]
+        ws_pen.update_cells(cells)
+
+    att_status_col = idx.get("Status")
+    att_markedby_col = _header_index(headers, "Marked By")
+    update_cells = []
+    new_att_rows = []
+    new_penalty_rows = []
+    running_late = dict(late_counts)
+
+    for student, status in marks.items():
+        old = existing_row.get(student)
+        old_status = old[1] if old else None
+        if old_status == status:
+            continue
+
+        if old:
+            row_number = old[0]
+            if att_status_col is not None:
+                update_cells.append(gspread.Cell(row_number, att_status_col + 1, status))
+            if att_markedby_col is not None:
+                update_cells.append(gspread.Cell(row_number, att_markedby_col + 1, "Telegram Admin"))
+        else:
+            new_att_rows.append([now_str(), student, group_name, date_str, status, "Telegram Admin"])
+
+        if status == "Absent":
+            new_penalty_rows.append([now_str(), student, group_name, f"Unexcused absence ({date_str})", 1, "System", "System", "Active"])
+        elif status == "Late":
+            running_late[student] = running_late.get(student, 0) + 1
+            if running_late[student] % 3 == 0:
+                new_penalty_rows.append([now_str(), student, group_name, f"Lateness ({date_str})", 1, "System", "System", "Active"])
+
+    if update_cells:
+        ws_att.update_cells(update_cells)
+    if new_att_rows:
+        ws_att.append_rows(new_att_rows, value_input_option="USER_ENTERED")
+    if new_penalty_rows:
+        ws_pen.append_rows(new_penalty_rows, value_input_option="USER_ENTERED")
+
+    invalidate_cache("Attendance_Log")
+    invalidate_cache("Penalty_Log")
 
 def add_roster_student(name, tg_handle, group):
     """Adds a student to Roster for a given group (Status: active).
