@@ -120,9 +120,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(messages.status_not_found())
 
-
 async def penalty(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Report the sender's total active penalty points from Penalty Tracker."""
+    """Report the sender's total active penalty points — reads from the
+    same Admin Panel Penalty_Log everything else uses (Roster, /admin
+    profile view, etc.), NOT the old separate Penalty Tracker spreadsheet.
+    """
     user = update.message.from_user
     username = user.username
 
@@ -130,13 +132,16 @@ async def penalty(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(messages.welcome_no_username())
         return
 
-    rec = await asyncio.to_thread(sheets.find_penalty_record, username)
-    if rec:
-        await update.message.reply_text(
-            messages.penalty_found(rec["name"], rec["class"], rec["points"])
-        )
-    else:
+    matches = await asyncio.to_thread(sheets.search_roster, username)
+    match = next((m for m in matches if m["tg"].lstrip("@").lower() == username.lower()), None)
+    if not match:
         await update.message.reply_text(messages.penalty_not_found())
+        return
+
+    points = await asyncio.to_thread(sheets.get_penalty_total, match["name"])
+    await update.message.reply_text(
+        messages.penalty_found(match["name"], match["group"], str(points))
+    )
 
 
 async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
