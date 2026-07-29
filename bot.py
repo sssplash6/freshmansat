@@ -199,35 +199,42 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(messages.proof_received())
     log.info("Proof from @%s recorded (file_id=%s)", username, file_id)
 
-
-async def set_payment_status(bot, target_username: str, status_label: str, source: str) -> tuple[bool, str]:
-    """Single entry point for changing a student's payment status to any of
-    Paid / Scholarship / Pending / Cancel. This is the ONLY place that
-    writes payment status to the Finance sheet.
+async def set_payment_status(bot, target_username: str, status_label: str, source: str, amount=None) -> tuple[bool, str]:
+    """Read-only Finance policy: this function NEVER writes to the Finance
+    sheet. It only logs the action to Payment_Log (the audit trail) and
+    notifies the student on Paid/Scholarship. The Finance sheet itself must
+    be updated manually by an admin — this is intentional, so the bot has
+    no write access to Finance at all for security reasons.
     """
     rec = await asyncio.to_thread(sheets.find_student, target_username)
     if not rec:
         return False, f"No student record found for @{target_username}."
 
     bd_entry = await asyncio.to_thread(sheets.find_bot_data_row, target_username)
+    log_amount = amount if amount is not None else rec["amount"]
 
-    await asyncio.to_thread(sheets.set_finance_status, rec["worksheet"], rec["row_number"], status_label)
     await asyncio.to_thread(
-        sheets.log_payment_change, rec["name"], target_username, status_label, source, rec["amount"]
+        sheets.log_payment_change, rec["name"], target_username, status_label, source, log_amount
     )
 
-    if bd_entry and bd_entry.get("chat_id"):
-        await asyncio.to_thread(sheets.update_last_known_status, bd_entry["row_number"], status_label)
+    if bd_entry:
         if status_label.strip().lower() in config.PAID_STATUSES:
-            try:
-                await notify_student(
-                    bot, int(bd_entry["chat_id"]), text=messages.payment_success(rec["name"])
-                )
-            except Exception as exc:
-                log.warning("Could not notify @%s of payment approval: %s", target_username, exc)
+            # Mark Bot Data as already-notified so the daily payment-check
+            # job doesn't send a duplicate thank-you once the admin later
+            # updates the real Finance sheet to match.
+            await asyncio.to_thread(sheets.update_last_known_status, bd_entry["row_number"], status_label)
+            if bd_entry.get("chat_id"):
+                try:
+                    await notify_student(
+                        bot, int(bd_entry["chat_id"]), text=messages.payment_success(rec["name"])
+                    )
+                except Exception as exc:
+                    log.warning("Could not notify @%s of payment approval: %s", target_username, exc)
 
-    return True, f"Marked @{target_username} ({rec['name']}) as {status_label}."
-
+    return True, (
+        f"Logged @{target_username} ({rec['name']}) as {status_label} in Payment_Log. "
+        f"⚠️ Remember to update the Finance sheet manually — the bot no longer writes there."
+    )
 
 async def set_bot_commands(app: Application):
     """Registers Telegram's native '/' autocomplete menu. Every admin
@@ -595,23 +602,22 @@ def _tuition_amount_keyboard() -> InlineKeyboardMarkup:
 
 async def _finalize_addstudent(name: str, tg: str, group: str, amount) -> str:
     await asyncio.to_thread(sheets.add_roster_student, name, tg, group)
-    try:
-        await asyncio.to_thread(sheets.add_finance_student, group, name, tg, amount, "Pending")
-    except Exception as exc:
-        log.warning("add_finance_student failed for %s in %s: %s", name, group, exc)
-        return (
-            f"Added {name} to Roster and {group}'s attendance tab, but couldn't create their "
-            f"Finance row automatically ({exc})."
-        )
-    return f"Added {name}" + (f" (@{tg})" if tg else " (no TG handle yet)") + f" to {group}, tuition ${amount} (Pending)."
+    await asyncio.to_thread(sheets.log_payment_change, name, tg, "Pending", "admin_add_student", amount)
+    return (
+        f"Added {name}" + (f" (@{tg})" if tg else " (no TG handle yet)") + f" to {group}.\n\n"
+        f"⚠️ Tuition (${amount}) logged in Payment_Log only — add them to the Finance sheet "
+        f"manually, since the bot no longer writes there."
+    )
 
 async def _finalize_edittuition(student_name: str, amount) -> str:
     rec = await asyncio.to_thread(sheets.find_student, student_name)
-    if not rec:
-        return f"⚠️ No payment record found for {student_name}."
-    await asyncio.to_thread(sheets.set_finance_amount, rec["worksheet"], rec["row_number"], amount)
-    await asyncio.to_thread(sheets.log_payment_change, rec["name"], rec["tg"], rec["status"], "admin_override_tuition", amount)
-    return f"Updated {student_name}'s tuition to ${amount}."
+    tg = rec["tg"] if rec else ""
+    current_status = rec["status"] if rec else ""
+    await asyncio.to_thread(sheets.log_payment_change, student_name, tg, current_status, "admin_override_tuition", amount)
+    return (
+        f"Logged a tuition change to ${amount} for {student_name} in Payment_Log.\n\n"
+        f"⚠️ Update the Finance sheet manually — the bot no longer writes there."
+    )
 
 async def admin_tuition_preset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
